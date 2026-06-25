@@ -80,9 +80,12 @@ function ConcertMap({ events }) {
         const coords = await geocodeCity(event.city, cache);
         if (cancelled) return;
         if (!coords) continue;
-        const when = event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA';
+        const when = `${event.dayLabel ? event.dayLabel + ' ' : ''}${event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA'}`;
         const lineup = (event.lineup || [event.artist]).join(', ');
-        const popup = `<strong>${event.name || event.artist}</strong><br>${when}<br>${event.city || 'Location TBA'}<br>${lineup}<br><a href="${event.url}" target="_blank" rel="noreferrer">Tickets</a>`;
+        const where = [event.venue, event.city, event.country].filter(Boolean).join(', ') || 'Location TBA';
+        const vendor = event.ticketVendor ? `<br><em>${event.onSale ? 'On sale' : 'Tickets'} · ${event.ticketVendor}</em>` : '';
+        const img = event.image ? `<img src="${event.image}" alt="" style="width:100%;height:96px;object-fit:cover;border-radius:8px;margin-bottom:6px">` : '';
+        const popup = `${img}<strong>${event.name || event.artist}</strong><br>${when}<br>${where}<br>${lineup}${vendor}<br><a href="${event.url}" target="_blank" rel="noreferrer">Open in Spotify</a>`;
         window.L.marker([coords.lat, coords.lon]).bindPopup(popup).addTo(layer);
         bounds.push([coords.lat, coords.lon]);
         placed++;
@@ -231,7 +234,15 @@ function App() {
     {events.length > 0 && <div className="viewToggle"><button className={`ghost ${view === 'list' ? 'on' : ''}`} onClick={() => setView('list')}>List</button><button className={`ghost ${view === 'map' ? 'on' : ''}`} onClick={() => setView('map')}>Map</button></div>}
     {view === 'map'
       ? <section className="results"><ConcertMap events={events} /></section>
-      : <section className="results eventGrid">{events.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}><span>{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span><h3>{e.name}</h3><p>{e.city || 'Location TBA'}</p><p>{(e.lineup || [e.artist]).join(', ')}</p></a>)}</section>}
+      : <section className="results eventGrid">{events.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}>
+          {e.image && <img className="eventImg" src={e.image} alt={e.artist} loading="lazy" />}
+          <span>{e.dayLabel ? `${e.dayLabel} · ` : ''}{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span>
+          <h3>{e.name}</h3>
+          <p>{[e.venue, e.city, e.country].filter(Boolean).join(', ') || 'Location TBA'}</p>
+          <p>{(e.lineup || [e.artist]).join(', ')}</p>
+          {e.genres?.length > 0 && <div className="genres">{e.genres.slice(0, 4).map(g => <span className="genre" key={g}>{g}</span>)}</div>}
+          {e.ticketVendor && <span className="vendor">{e.onSale ? 'On sale' : 'Tickets'} · {e.ticketVendor}</span>}
+        </a>)}</section>}
   </main>;
 }
 

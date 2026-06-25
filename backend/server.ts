@@ -107,51 +107,144 @@ function stripHtml(value: string) {
   return value.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+const SCRAPER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Scrape an artist's /concerts page for the list of shows (page reused by caller).
+async function scrapeArtistConcerts(page: any, artist: any) {
+  const artistUrl = `https://open.spotify.com/artist/${artist.id}/concerts`;
+  await page.goto(artistUrl, { waitUntil: 'networkidle', timeout: 60000 });
+  await page.waitForSelector('a[data-testid="concert-row"], a[href^="/concert/"]', { timeout: 20000 }).catch(() => null);
+  await page.waitForTimeout(1500);
+  const rows = await page.evaluate((artistName: string) => {
+    return Array.from(document.querySelectorAll('a[data-testid="concert-row"], a[href^="/concert/"]')).map((row) => {
+      const link = row as HTMLAnchorElement;
+      const time = row.querySelector('time') as HTMLTimeElement | null;
+      const parts = ((row as HTMLElement).innerText || row.textContent || '').split('\n').map(part => part.trim()).filter(Boolean);
+      const city = parts.find(part => !/^[A-Z][a-z]{2}$/.test(part) && !/^\d{1,2}$/.test(part) && part !== artistName && !/^\d{1,2}:\d{2}\s?(AM|PM)$/i.test(part)) || '';
+      const href = link.href || link.getAttribute('href') || '';
+      const id = href.split('/concert/')[1]?.split(/[?#]/)[0] || href;
+      return {
+        id,
+        artist: artistName,
+        name: artistName,
+        date: time?.dateTime || '',
+        city,
+        lineup: [artistName],
+        type: 'Spotify concert',
+        url: href.startsWith('http') ? href : `https://open.spotify.com${href}`,
+        source: 'spotify-page-scrape'
+      };
+    });
+  }, artist.name);
+  const image = artist.images?.[0]?.url || null;
+  return rows.map((event: any) => ({ ...event, artistUrl, image }));
+}
+
+// Scrape a single /concert/{id} detail page. Best-effort: every field nullable,
+// never throws (returns empty fields on any failure).
+async function scrapeConcertDetail(page: any, url: string) {
+  const empty = { venue: null, country: null, dayLabel: null, genres: [] as string[], ticketVendor: null, onSale: false };
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(1200);
+    return await page.evaluate(() => {
+      const title = document.title || '';
+      const venueFromTitle = (title.match(/\(([^)]+)\)/) || [])[1] || null;
+      const text = (document.querySelector('main') as HTMLElement)?.innerText || document.body.innerText || '';
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+      const locLine = lines.find(l => /^.+,\s*.+,\s*[A-Z]{2}$/.test(l)) || '';
+      const locParts = locLine ? locLine.split(',').map(s => s.trim()) : [];
+      const country = locParts.length === 3 ? locParts[2] : null;
+      const venue = venueFromTitle || (locParts.length === 3 ? locParts[0] : null);
+      const dayLine = lines.find(l => /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),/.test(l)) || '';
+      const dayLabel = dayLine ? dayLine.slice(0, 3) : null;
+      const locIdx = locLine ? lines.indexOf(locLine) : -1;
+      const genres: string[] = [];
+      if (locIdx > 0) {
+        for (let i = locIdx - 1; i >= 0 && genres.length < 6; i--) {
+          const l = lines[i];
+          if (/^[a-z0-9][a-z0-9 \-&/]+$/.test(l) && l.length <= 24) genres.unshift(l); else break;
+        }
+      }
+      const findIdx = lines.findIndex(l => /^Find tickets$/i.test(l));
+      const vendorCand = findIdx > 0 ? lines[findIdx - 1] : null;
+      const ticketVendor = vendorCand && !/^On sale$/i.test(vendorCand) ? vendorCand : null;
+      const onSale = lines.some(l => /^On sale$/i.test(l));
+      return { venue, country, dayLabel, genres, ticketVendor, onSale };
+    });
+  } catch {
+    return empty;
+  }
+}
+
+// Concert detail rarely changes, so cache it for the process lifetime keyed by
+// concert id. Repeat "Find concerts" runs then skip the network entirely.
+const concertDetailCache = new Map<string, any>();
+const DETAIL_CONCURRENCY = 5;
+
+// Enrich events with detail-page fields concurrently using a small pool of pages.
+// Cache hits skip the network; misses are scraped and cached. Per-event errors
+// are logged and leave the event with its basic (list) fields.
+async function enrichConcertsDetail(context: any, events: any[]) {
+  let next = 0;
+  async function worker() {
+    const page = await context.newPage();
+    try {
+      while (next < events.length) {
+        const event = events[next++];
+        const cached = concertDetailCache.get(event.id);
+        if (cached) { Object.assign(event, cached); continue; }
+        try {
+          const detail = await scrapeConcertDetail(page, event.url);
+          concertDetailCache.set(event.id, detail);
+          Object.assign(event, detail);
+        } catch (detailError) {
+          logAuth('concert_detail_error', { url: event.url, message: detailError instanceof Error ? detailError.message : 'Detail scrape failed' });
+        }
+      }
+    } finally {
+      await page.close();
+    }
+  }
+  const poolSize = Math.min(DETAIL_CONCURRENCY, events.length);
+  await Promise.all(Array.from({ length: poolSize }, () => worker()));
+}
+
+// Thin wrapper that owns its own browser — used by the test routes.
 async function scrapeSpotifyConcertPage(artist: any) {
   const { chromium } = await import('playwright');
   const browser = await chromium.launch({ headless: true });
   try {
-    const page = await browser.newPage({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' });
-    const artistUrl = `https://open.spotify.com/artist/${artist.id}/concerts`;
-    await page.goto(artistUrl, { waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForSelector('a[data-testid="concert-row"], a[href^="/concert/"]', { timeout: 20000 }).catch(() => null);
-    await page.waitForTimeout(1500);
-    const rows = await page.evaluate((artistName) => {
-      return Array.from(document.querySelectorAll('a[data-testid="concert-row"], a[href^="/concert/"]')).map((row) => {
-        const link = row as HTMLAnchorElement;
-        const time = row.querySelector('time') as HTMLTimeElement | null;
-        const parts = ((row as HTMLElement).innerText || row.textContent || '').split('\n').map(part => part.trim()).filter(Boolean);
-        const city = parts.find(part => !/^[A-Z][a-z]{2}$/.test(part) && !/^\d{1,2}$/.test(part) && part !== artistName && !/^\d{1,2}:\d{2}\s?(AM|PM)$/i.test(part)) || '';
-        const href = link.href || link.getAttribute('href') || '';
-        const id = href.split('/concert/')[1]?.split(/[?#]/)[0] || href;
-        return {
-          id,
-          artist: artistName,
-          name: artistName,
-          date: time?.dateTime || '',
-          city,
-          lineup: [artistName],
-          type: 'Spotify concert',
-          url: href.startsWith('http') ? href : `https://open.spotify.com${href}`,
-          source: 'spotify-page-scrape'
-        };
-      });
-    }, artist.name);
-    return rows.map((event: any) => ({ ...event, artistUrl }));
+    const context = await browser.newContext({ userAgent: SCRAPER_UA });
+    const page = await context.newPage();
+    const events = await scrapeArtistConcerts(page, artist);
+    await page.close();
+    await enrichConcertsDetail(context, events);
+    return events;
   } finally {
     await browser.close();
   }
 }
 
 async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
+  const { chromium } = await import('playwright');
   const events = [];
-  for (const artistId of artistIds.slice(0, 25)) {
-    const artist = await spotify(`/artists/${artistId}`, accessToken);
-    try {
-      events.push(...await scrapeSpotifyConcertPage(artist));
-    } catch (error) {
-      logAuth('concert_scrape_error', { artistId, message: error instanceof Error ? error.message : 'Scrape failed' });
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext({ userAgent: SCRAPER_UA });
+    const listPage = await context.newPage();
+    for (const artistId of artistIds.slice(0, 25)) {
+      const artist = await spotify(`/artists/${artistId}`, accessToken);
+      try {
+        events.push(...await scrapeArtistConcerts(listPage, artist));
+      } catch (error) {
+        logAuth('concert_scrape_error', { artistId, message: error instanceof Error ? error.message : 'Scrape failed' });
+      }
     }
+    await listPage.close();
+    await enrichConcertsDetail(context, events);
+  } finally {
+    await browser.close();
   }
   events.sort((a: any, b: any) => String(a.date || '').localeCompare(String(b.date || '')));
   return { events, source: 'spotify-page-scrape', message: events.length ? '' : 'No Spotify concerts were returned for the selected artists.' };
