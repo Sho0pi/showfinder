@@ -229,6 +229,9 @@ function App() {
       });
   }, [artists, selected, artistSearch]);
 
+  // Only show shows whose artist is still selected, so deselecting hides them live.
+  const shownEvents = useMemo(() => events.filter(e => !e.artistId || selected.includes(e.artistId)), [events, selected]);
+
   function selectVisibleArtists() {
     setSelected(current => [...new Set([...current, ...visibleArtists.map(artist => artist.id).filter(Boolean)])]);
   }
@@ -244,10 +247,10 @@ function App() {
     <section className="hero"><div><p className="eyebrow">Connected as {auth.user?.display_name || auth.user?.id}</p><h1>Your Spotify radar</h1><p>Your artists load automatically. Pick the ones you care about, then pull their latest Spotify releases.</p></div><button className="ghost" onClick={() => { localStorage.removeItem('spotify_access_token'); setToken(''); }}>Sign out</button></section>
     {error && <div className="notice error">{error}</div>}{loading && <div className="notice">{loading}...</div>}
     <section className="grid"><aside className="card"><h2>Actions</h2><p>This scrapes Spotify's own concert data and formats the results here.</p><button onClick={loadArtists}>Refresh artists</button><button onClick={findConcerts} disabled={!selected.length}>Find Spotify concerts</button></aside><section className="card"><div className="artistHeader"><div><h2>Artists</h2><p>{selected.length} selected. Selected artists stay on top.</p></div><div className="artistTools"><input value={artistSearch} onChange={e => setArtistSearch(e.target.value)} placeholder="Search artists" aria-label="Search artists" /><button className="ghost" onClick={selectVisibleArtists} disabled={!visibleArtists.length}>Select shown</button><button className="ghost" onClick={deselectVisibleArtists} disabled={!visibleArtists.length}>Deselect shown</button></div></div><div className="chips">{visibleArtists.map(a => <button key={a.id || a.name} className={`chip ${selected.includes(a.id) ? 'on' : ''}`} onClick={() => setSelected(s => s.includes(a.id) ? s.filter(x => x !== a.id) : [...s, a.id])}>{a.name}</button>)}</div></section></section>
-    {events.length > 0 && <div className="viewToggle"><button className={`ghost ${view === 'list' ? 'on' : ''}`} onClick={() => setView('list')}>List</button><button className={`ghost ${view === 'map' ? 'on' : ''}`} onClick={() => setView('map')}>Map</button></div>}
+    {shownEvents.length > 0 && <div className="viewToggle"><button className={`ghost ${view === 'list' ? 'on' : ''}`} onClick={() => setView('list')}>List</button><button className={`ghost ${view === 'map' ? 'on' : ''}`} onClick={() => setView('map')}>Map</button></div>}
     {view === 'map'
-      ? <section className="results"><ConcertMap events={events} /></section>
-      : <section className="results eventGrid">{events.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}>
+      ? <section className="results"><ConcertMap events={shownEvents} /></section>
+      : <section className="results eventGrid">{shownEvents.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}>
           {e.image && <img className="eventImg" src={e.image} alt={e.artist} loading="lazy" />}
           <span>{e.dayLabel ? `${e.dayLabel} · ` : ''}{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span>
           <h3>{e.name}</h3>

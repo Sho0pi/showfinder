@@ -285,7 +285,7 @@ async function scrapeArtistConcerts(page: any, artist: any) {
     });
   }, artist.name);
   const image = artist.images?.[0]?.url || null;
-  return rows.map((event: any) => ({ ...event, artistUrl, image }));
+  return rows.map((event: any) => ({ ...event, artistId: artist.id, artistUrl, image }));
 }
 
 // Scrape a single /concert/{id} detail page. Best-effort: every field nullable,
