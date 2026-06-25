@@ -283,7 +283,9 @@ async function fetchConcertDetail(url: string, concertId: string, retries = 2): 
   return parseConcertDetailHtml(await res.text(), concertId);
 }
 
-// Enrich events with detail fields via concurrent HTTP fetches, cached by concert id.
+// Enrich events with detail fields, staggered to stay under open.spotify.com's
+// rate limit: a small pool, a short gap between each fetch, cached by concert id.
+const DETAIL_GAP_MS = 250;
 async function enrichConcertsHttp(events: any[]) {
   let next = 0;
   async function worker() {
@@ -298,9 +300,10 @@ async function enrichConcertsHttp(events: any[]) {
       } catch (detailError) {
         logAuth('concert_detail_http_error', { id: event.id, message: detailError instanceof Error ? detailError.message : 'Detail fetch failed' });
       }
+      if (next < events.length) await new Promise(r => setTimeout(r, DETAIL_GAP_MS));
     }
   }
-  const poolSize = Math.min(4, events.length);
+  const poolSize = Math.min(2, events.length);
   await Promise.all(Array.from({ length: poolSize }, () => worker()));
   return events;
 }
