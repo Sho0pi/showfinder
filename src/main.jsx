@@ -251,7 +251,7 @@ function App() {
     {view === 'map'
       ? <section className="results"><ConcertMap events={shownEvents} /></section>
       : <section className="results eventGrid">{shownEvents.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}>
-          {e.image && <img className="eventImg" src={e.image} alt={e.artist} loading="lazy" />}
+          {e.image && <img className="eventImg" src={e.image} alt={e.artist} loading="lazy" decoding="async" width="320" height="150" />}
           <span>{e.dayLabel ? `${e.dayLabel} · ` : ''}{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span>
           <h3>{e.name}</h3>
           <p>{[e.venue, e.city, e.country].filter(Boolean).join(', ') || 'Location TBA'}</p>

@@ -211,8 +211,7 @@ function parseConcertDetailHtml(html: string, concertId: string) {
     const c = items[key];
     const offer = c.offers?.items?.[0] || {};
     const dayLabel = c.startDateIsoString ? new Date(c.startDateIsoString).toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }) : null;
-    const sources = c.artists?.items?.[0]?.data?.visuals?.avatarImage?.sources || [];
-    const image = sources[sources.length - 1]?.url || sources[0]?.url || null;
+    const image = pickImage(c.artists?.items?.[0]?.data?.visuals?.avatarImage?.sources, 320);
     return {
       venue: c.location?.name || null,
       country: c.location?.country || null,
@@ -374,6 +373,18 @@ async function scrapeSpotifyConcertPage(artist: any) {
   }
 }
 
+// Pick the image source closest to a target width (cards are small — a 320px
+// thumbnail loads far faster than the 640px original).
+function pickImage(sources: any[], target = 320): string | null {
+  const list = (sources || []).filter((s: any) => s?.url);
+  if (!list.length) return null;
+  let best = list[0];
+  for (const s of list) {
+    if (Math.abs((s.width || 9999) - target) < Math.abs((best.width || 9999) - target)) best = s;
+  }
+  return best.url || null;
+}
+
 // Fetch name + image for many artists in one Spotify API call (up to 50 ids).
 async function getArtistMeta(accessToken: string, artistIds: string[]) {
   const map = new Map<string, { name: string; image: string | null }>();
@@ -381,7 +392,7 @@ async function getArtistMeta(accessToken: string, artistIds: string[]) {
     const ids = artistIds.slice(i, i + 50).join(',');
     try {
       const data = await spotify(`/artists?ids=${ids}`, accessToken);
-      for (const a of data.artists || []) if (a?.id) map.set(a.id, { name: a.name || a.id, image: a.images?.[0]?.url || null });
+      for (const a of data.artists || []) if (a?.id) map.set(a.id, { name: a.name || a.id, image: pickImage(a.images, 320) });
     } catch (error) {
       logAuth('artist_meta_error', { message: error instanceof Error ? error.message : 'Meta fetch failed' });
     }
