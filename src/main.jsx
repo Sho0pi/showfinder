@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { motion } from 'framer-motion';
-import { Music2, MapPin, LogOut, Search, CalendarDays, Ticket, RefreshCw, X, Check, Filter } from 'lucide-react';
+import { Music2, MapPin, LogOut, Search, CalendarDays, Ticket, RefreshCw, X, Check, Filter, Globe } from 'lucide-react';
+import { COUNTRIES, CONTINENTS, countriesInContinent, continentOf } from './regions';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_BASE || '/api';
@@ -185,6 +186,70 @@ function ArtistRail({ artists, selected, toggle, counts }) {
   );
 }
 
+function RegionBar({ regionSet, setRegionSet }) {
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState(false);
+
+  const toggleCountry = (c) => setRegionSet(s => { const n = new Set(s); n.has(c) ? n.delete(c) : n.add(c); return n; });
+  const continentState = (code) => {
+    const cs = countriesInContinent(code);
+    const on = cs.filter(c => regionSet.has(c)).length;
+    return on === 0 ? 'none' : on === cs.length ? 'all' : 'some';
+  };
+  const toggleContinent = (code) => {
+    const cs = countriesInContinent(code);
+    const allOn = cs.every(c => regionSet.has(c));
+    setRegionSet(s => { const n = new Set(s); cs.forEach(c => allOn ? n.delete(c) : n.add(c)); return n; });
+  };
+
+  const query = q.trim().toLowerCase();
+  const results = query
+    ? Object.keys(COUNTRIES).filter(c => COUNTRIES[c].name.toLowerCase().includes(query) || c.toLowerCase() === query).slice(0, 8)
+    : [];
+  // Individual chips only for countries whose continent isn't fully selected (the
+  // continent chip already represents those), so picking a whole continent stays tidy.
+  const chips = [...regionSet].filter(c => continentState(continentOf(c)) !== 'all');
+
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-2">
+      <span className="mr-1 inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-muted"><Globe size={13} /> Region</span>
+      {CONTINENTS.map(ct => {
+        const st = continentState(ct.code);
+        return (
+          <button key={ct.code} onClick={() => toggleContinent(ct.code)}
+            className={`rounded-full px-3 py-1.5 text-sm transition ${st === 'all' ? 'bg-ember text-canvas' : st === 'some' ? 'border border-ember text-ember' : 'border border-line text-muted hover:text-ink'}`}>
+            {ct.name}
+          </button>
+        );
+      })}
+      <div className="relative">
+        <input
+          value={q} onChange={e => { setQ(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)} onBlur={() => setTimeout(() => setOpen(false), 150)}
+          placeholder="+ country" aria-label="Add country"
+          className="w-32 rounded-full border border-line bg-canvas px-3 py-1.5 text-sm text-ink outline-none focus:border-ember"
+        />
+        {open && results.length > 0 && (
+          <div className="absolute z-[600] mt-1 max-h-60 w-56 overflow-auto rounded-md border border-line bg-surface p-1 shadow-xl">
+            {results.map(c => (
+              <button key={c} onMouseDown={() => { toggleCountry(c); setQ(''); }}
+                className={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-sm hover:bg-surface2 ${regionSet.has(c) ? 'text-ember' : 'text-ink'}`}>
+                {COUNTRIES[c].name}<span className="font-mono text-xs text-muted">{c}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {chips.map(c => (
+        <span key={c} className="inline-flex items-center gap-1 rounded-full bg-surface2 px-2.5 py-1 font-mono text-xs text-ink">
+          {c} <button onClick={() => toggleCountry(c)} className="text-muted hover:text-ember" aria-label={`Remove ${c}`}><X size={12} /></button>
+        </span>
+      ))}
+      {regionSet.size > 0 && <button onClick={() => setRegionSet(new Set())} className="text-xs text-muted underline hover:text-ember">clear</button>}
+    </div>
+  );
+}
+
 function ShowCard({ e, i }) {
   const date = `${e.dayLabel ? e.dayLabel.toUpperCase() + ' · ' : ''}${e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}`;
   const where = [e.venue, e.city, e.country].filter(Boolean).join(', ') || 'Location TBA';
@@ -231,6 +296,7 @@ function App() {
   const [filters, setFilters] = useState({ continent: '', country: '', city: '', radius: '', startDate: '', endDate: '' });
   const [artistSearch, setArtistSearch] = useState('');
   const [hideEmpty, setHideEmpty] = useState(false);
+  const [regionSet, setRegionSet] = useState(() => new Set());
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -342,8 +408,9 @@ function App() {
     const day = String(e.date || '').slice(0, 10);
     if (filters.startDate && (!day || day < filters.startDate)) return false;
     if (filters.endDate && (!day || day > filters.endDate)) return false;
+    if (regionSet.size && !regionSet.has(e.country)) return false;
     return true;
-  }), [events, selected, filters.startDate, filters.endDate]);
+  }), [events, selected, filters.startDate, filters.endDate, regionSet]);
 
   // Lazily enrich (venue/genres/vendor/coords) only the shows currently shown.
   const enrichedRef = React.useRef(new Set());
@@ -456,19 +523,20 @@ function App() {
         </section>
       </section>
 
-      {/* Results — map always on top, cards below */}
-      {shownEvents.length > 0 && (
+      {/* Results — region filter + map on top, cards below */}
+      {selected.length > 0 && (
         <>
           <section className="mt-8">
             <div className="mb-3 flex items-baseline gap-2">
               <h2 className="font-display text-lg font-bold">On the map</h2>
               <span className="font-mono text-xs text-muted">{shownEvents.length} {shownEvents.length === 1 ? 'show' : 'shows'}</span>
             </div>
+            <RegionBar regionSet={regionSet} setRegionSet={setRegionSet} />
             <ConcertMap events={shownEvents} />
           </section>
-          <section className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-            {shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} />)}
-          </section>
+          {shownEvents.length > 0
+            ? <section className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} />)}</section>
+            : <p className="mt-6 font-mono text-sm text-muted">No shows match your filters.</p>}
         </>
       )}
     </main>
