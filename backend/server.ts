@@ -144,7 +144,11 @@ const SCRAPER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // from one browser load (so a Spotify deploy that rotates the hash self-heals on
 // the next harvest), cache them, and then hit the API with plain fetch.
 const HARVEST_TTL_MS = 40 * 60 * 1000;
-let harvestCache: { headers: Record<string, string>; hash: string; capturedAt: number } | null = null;
+// The "concert" detail query (api-partner) needs the FULL browser header set, not
+// just auth/client-token. We capture these from the live ArtistConcerts request.
+const HEADER_KEYS = ['authorization', 'client-token', 'spotify-app-version', 'app-platform', 'user-agent', 'accept', 'content-type', 'referer', 'accept-language', 'sec-ch-ua', 'sec-ch-ua-platform', 'sec-ch-ua-mobile'];
+const CONCERT_HASH_FALLBACK = '21afefc1c7f9e38cbf7c60d03f5c8b6e602b7a91e04f2c2e0aa7d1743052768e';
+let harvestCache: { headers: Record<string, string>; hash: string; concertHash: string; capturedAt: number } | null = null;
 let harvestInFlight: Promise<any> | null = null;
 
 async function harvestSpotifyApi() {
@@ -152,32 +156,36 @@ async function harvestSpotifyApi() {
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage({ userAgent: SCRAPER_UA });
-    let cap: { headers: Record<string, string>; hash: string } | null = null;
+    let listCap: { headers: Record<string, string>; hash: string } | null = null;
+    let concertHash = '';
     page.on('request', (req) => {
-      if (cap || !req.url().includes('pathfinder/v2/query') || req.method() !== 'POST') return;
+      if (!req.url().includes('pathfinder/v2/query') || req.method() !== 'POST') return;
       let body: any = {};
       try { body = JSON.parse(req.postData() || '{}'); } catch {}
-      if (!/concert/i.test(body.operationName || '')) return;
-      const h = req.headers();
-      cap = {
-        headers: {
-          authorization: h.authorization,
-          'client-token': h['client-token'],
-          'spotify-app-version': h['spotify-app-version'],
-          'app-platform': h['app-platform'] || 'WebPlayer',
-          'user-agent': h['user-agent'] || SCRAPER_UA,
-          accept: 'application/json',
-          'content-type': 'application/json;charset=UTF-8'
-        },
-        hash: body.extensions?.persistedQuery?.sha256Hash || ''
-      };
+      const op = body.operationName || '';
+      const hash = body.extensions?.persistedQuery?.sha256Hash || '';
+      if (op === 'ArtistConcerts' && !listCap) {
+        const h = req.headers();
+        const headers: Record<string, string> = { accept: 'application/json', 'content-type': 'application/json;charset=UTF-8' };
+        for (const k of HEADER_KEYS) if (h[k]) headers[k] = h[k];
+        listCap = { headers, hash };
+      } else if (op === 'concert' && hash) {
+        concertHash = hash;
+      }
     });
+    // Artist concerts page → captures the list query + the full header set.
     await page.goto('https://open.spotify.com/artist/0jq1z5MQSlFtvpbnLzeEul/concerts', { waitUntil: 'networkidle', timeout: 60000 });
     await page.waitForTimeout(2500);
-    if (!cap || !cap.headers.authorization || !cap.headers['client-token'] || !cap.hash) {
+    // Visit one concert to capture the live "concert" detail query hash (self-healing).
+    const concertHref = await page.evaluate(() => document.querySelector('a[href^="/concert/"]')?.getAttribute('href') || '').catch(() => '');
+    if (concertHref) {
+      await page.goto('https://open.spotify.com' + concertHref, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+    if (!listCap || !listCap.headers.authorization || !listCap.headers['client-token'] || !listCap.hash) {
       throw new Error('Failed to harvest pathfinder credentials');
     }
-    harvestCache = { ...cap, capturedAt: Date.now() };
+    harvestCache = { headers: listCap.headers, hash: listCap.hash, concertHash: concertHash || CONCERT_HASH_FALLBACK, capturedAt: Date.now() };
     return harvestCache;
   } finally {
     await browser.close();
@@ -283,9 +291,47 @@ async function fetchConcertDetail(url: string, concertId: string, retries = 2): 
   return parseConcertDetailHtml(await res.text(), concertId);
 }
 
-// Enrich events with detail fields, staggered to stay under open.spotify.com's
-// rate limit: a small pool, a short gap between each fetch, cached by concert id.
-const DETAIL_GAP_MS = 250;
+// Concert detail via the api-partner "concert" pathfinder query — same tolerant
+// host as the artist list, structured JSON, no open.spotify.com page-scrape 429s.
+async function pathfinderConcertDetail(concertId: string, retry = true): Promise<any> {
+  const harvest = await getHarvest();
+  const body = JSON.stringify({
+    variables: { uri: `spotify:concert:${concertId}`, authenticated: false },
+    operationName: 'concert',
+    extensions: { persistedQuery: { version: 1, sha256Hash: harvest.concertHash } }
+  });
+  const res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', { method: 'POST', headers: harvest.headers, body, signal: AbortSignal.timeout(15000) });
+  if ((res.status === 401 || res.status === 403) && retry) {
+    await getHarvest(true);
+    return pathfinderConcertDetail(concertId, false);
+  }
+  if (res.status === 429 && retry) {
+    const wait = Math.min(Number(res.headers.get('retry-after') || 2), 10);
+    await new Promise(r => setTimeout(r, (wait + 0.3) * 1000));
+    return pathfinderConcertDetail(concertId, false);
+  }
+  if (!res.ok) throw new Error(`concert ${res.status}`);
+  const data = await res.json();
+  const c = data?.data?.concert;
+  if (!c) throw new Error('concert empty');
+  const offer = c.offers?.items?.[0] || {};
+  const dayLabel = c.startDateIsoString ? new Date(c.startDateIsoString).toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }) : null;
+  return {
+    venue: c.location?.name || null,
+    country: c.location?.country || null,
+    lat: c.location?.coordinates?.latitude ?? null,
+    lon: c.location?.coordinates?.longitude ?? null,
+    dayLabel,
+    genres: (c.concepts?.items || []).map((g: any) => g.data?.name).filter(Boolean),
+    ticketVendor: offer.providerName || null,
+    ticketUrl: offer.url || null,
+    onSale: String(offer.saleType || '').includes('on-sale'),
+    image: pickImage(c.artists?.items?.[0]?.data?.visuals?.avatarImage?.sources, 320)
+  };
+}
+
+// Enrich events with detail fields. Primary: api-partner concert query (tolerant
+// host). Fallback: the open.spotify.com page scrape. Cached by concert id.
 async function enrichConcertsHttp(events: any[]) {
   let next = 0;
   async function worker() {
@@ -294,16 +340,17 @@ async function enrichConcertsHttp(events: any[]) {
       const cached = concertDetailCache.get(event.id);
       if (cached) { Object.assign(event, cached); continue; }
       try {
-        const detail = await fetchConcertDetail(event.url, event.id);
-        concertDetailCache.set(event.id, detail);
+        let detail;
+        try { detail = await pathfinderConcertDetail(event.id); }
+        catch { detail = await fetchConcertDetail(event.url, event.id); }
+        cacheDetail(event.id, detail);
         Object.assign(event, detail);
       } catch (detailError) {
-        logAuth('concert_detail_http_error', { id: event.id, message: detailError instanceof Error ? detailError.message : 'Detail fetch failed' });
+        logAuth('concert_detail_error', { id: event.id, message: detailError instanceof Error ? detailError.message : 'Detail fetch failed' });
       }
-      if (next < events.length) await new Promise(r => setTimeout(r, DETAIL_GAP_MS));
     }
   }
-  const poolSize = Math.min(2, events.length);
+  const poolSize = Math.min(6, events.length);
   await Promise.all(Array.from({ length: poolSize }, () => worker()));
   return events;
 }
@@ -379,6 +426,22 @@ async function scrapeConcertDetail(page: any, url: string) {
 // Concert detail rarely changes, so cache it for the process lifetime keyed by
 // concert id. Repeat "Find concerts" runs then skip the network entirely.
 const concertDetailCache = new Map<string, any>();
+
+// Persist the detail cache to disk — concert detail rarely changes, so once fetched
+// it never needs re-fetching, even across restarts (near-zero detail requests later).
+const DETAIL_CACHE_FILE = new URL('../.detail-cache.json', import.meta.url);
+try {
+  const f = Bun.file(DETAIL_CACHE_FILE);
+  if (await f.exists()) for (const [k, v] of Object.entries(await f.json())) concertDetailCache.set(k, v);
+  console.log(`[cache] loaded ${concertDetailCache.size} cached concert details`);
+} catch {}
+let detailCacheDirty = false;
+function cacheDetail(id: string, detail: any) { concertDetailCache.set(id, detail); detailCacheDirty = true; }
+setInterval(() => {
+  if (!detailCacheDirty) return;
+  detailCacheDirty = false;
+  Bun.write(DETAIL_CACHE_FILE, JSON.stringify(Object.fromEntries(concertDetailCache))).catch(() => {});
+}, 5000);
 const DETAIL_CONCURRENCY = 5;
 
 // Enrich events with detail-page fields concurrently using a small pool of pages.
@@ -395,7 +458,7 @@ async function enrichConcertsDetail(context: any, events: any[]) {
         if (cached) { Object.assign(event, cached); continue; }
         try {
           const detail = await scrapeConcertDetail(page, event.url);
-          concertDetailCache.set(event.id, detail);
+          cacheDetail(event.id, detail);
           Object.assign(event, detail);
         } catch (detailError) {
           logAuth('concert_detail_error', { url: event.url, message: detailError instanceof Error ? detailError.message : 'Detail scrape failed' });
