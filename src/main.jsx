@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { motion } from 'framer-motion';
+import { Music2, MapPin, LogOut, Search, CalendarDays, List, Map as MapIcon, Ticket, RefreshCw, X } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_BASE || '/api';
@@ -23,8 +25,6 @@ function saveGeocodeCache(cache) {
 }
 
 // City string -> {lat, lon} via Nominatim, cached in localStorage.
-// Returns null for empty/unresolvable cities. Caches misses too (as null) so
-// we never re-hit the network for a city Nominatim can't place.
 async function geocodeCity(city, cache) {
   const key = String(city || '').trim().toLowerCase();
   if (!key) return null;
@@ -42,33 +42,35 @@ async function geocodeCity(city, cache) {
   return cache[key];
 }
 
+const CORAL_ICON = () => window.L.divIcon({
+  className: 'border-0 bg-transparent',
+  html: '<div class="pin-teardrop"></div>',
+  iconSize: [18, 18], iconAnchor: [9, 18], popupAnchor: [0, -18]
+});
+
 function ConcertMap({ events }) {
   const containerRef = React.useRef(null);
   const mapRef = React.useRef(null);
   const layerRef = React.useRef(null);
   const [status, setStatus] = useState('');
 
-  // Init the Leaflet map once.
   useEffect(() => {
     if (!window.L || !containerRef.current || mapRef.current) return;
-    const map = window.L.map(containerRef.current, { worldCopyJump: true }).setView([20, 0], 2);
-    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap', maxZoom: 18
+    const map = window.L.map(containerRef.current, { worldCopyJump: true, zoomControl: false }).setView([30, 5], 3);
+    window.L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 19, subdomains: 'abcd'
     }).addTo(map);
+    window.L.control.zoom({ position: 'bottomright' }).addTo(map);
     mapRef.current = map;
     layerRef.current = window.L.layerGroup().addTo(map);
     return () => { map.remove(); mapRef.current = null; };
   }, []);
 
-  // Geocode + plot whenever events change. Nominatim asks for <=1 req/s, so we
-  // queue lookups serially with a small gap; the cache makes repeats free.
   useEffect(() => {
     let cancelled = false;
     async function plot() {
       const map = mapRef.current, layer = layerRef.current;
       if (!map || !layer) return;
-      // Recalc size — the container may have reflowed (filter change, view toggle),
-      // which otherwise leaves Leaflet with stale dimensions and grey/misplaced tiles.
       map.invalidateSize();
       layer.clearLayers();
       const cache = loadGeocodeCache();
@@ -79,7 +81,6 @@ function ConcertMap({ events }) {
       if (uncached.length) setStatus(`Placing ${uncached.length} new ${uncached.length === 1 ? 'city' : 'cities'} on the map`);
       for (const event of events) {
         if (cancelled) return;
-        // Prefer exact coordinates from the detail data; geocode the city only as fallback.
         const hasCoords = event.lat != null && event.lon != null;
         const wasUncached = !hasCoords && event.city && !(String(event.city).trim().toLowerCase() in cache);
         const coords = hasCoords ? { lat: event.lat, lon: event.lon } : await geocodeCity(event.city, cache);
@@ -88,55 +89,122 @@ function ConcertMap({ events }) {
         const when = `${event.dayLabel ? event.dayLabel + ' ' : ''}${event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA'}`;
         const lineup = (event.lineup || [event.artist]).join(', ');
         const where = [event.venue, event.city, event.country].filter(Boolean).join(', ') || 'Location TBA';
-        const vendor = event.ticketVendor ? `<br><em>${event.onSale ? 'On sale' : 'Tickets'} · ${event.ticketVendor}</em>` : '';
-        const img = event.image ? `<img src="${event.image}" alt="" style="width:100%;height:96px;object-fit:cover;border-radius:8px;margin-bottom:6px">` : '';
-        const popup = `${img}<strong>${event.name || event.artist}</strong><br>${when}<br>${where}<br>${lineup}${vendor}<br><a href="${event.url}" target="_blank" rel="noreferrer">Open in Spotify</a>`;
-        window.L.marker([coords.lat, coords.lon]).bindPopup(popup).addTo(layer);
+        const vendor = event.ticketVendor ? `<br><em style="color:#8B8389">${event.onSale ? 'On sale' : 'Tickets'} · ${event.ticketVendor}</em>` : '';
+        const img = event.image ? `<img src="${event.image}" alt="" style="width:100%;height:96px;object-fit:cover;border-radius:8px;margin-bottom:8px">` : '';
+        const popup = `${img}<strong style="font-family:'Cabinet Grotesk',sans-serif;font-size:16px">${event.name || event.artist}</strong><br><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#FF5A3C">${when}</span><br><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#8B8389">${where}</span><br><span style="font-size:13px">${lineup}</span>${vendor}<br><a href="${event.ticketUrl || event.url}" target="_blank" rel="noreferrer">Tickets →</a>`;
+        window.L.marker([coords.lat, coords.lon], { icon: CORAL_ICON() }).bindPopup(popup).addTo(layer);
         bounds.push([coords.lat, coords.lon]);
         placed++;
         if (wasUncached) await new Promise(r => setTimeout(r, 1100));
       }
       if (cancelled) return;
-      if (bounds.length) { map.invalidateSize(); map.fitBounds(bounds, { padding: [40, 40], maxZoom: 6 }); }
+      if (bounds.length) { map.invalidateSize(); map.fitBounds(bounds, { padding: [50, 50], maxZoom: 6 }); }
       setStatus(placed ? '' : 'No shows could be placed on the map yet.');
     }
     plot();
     return () => { cancelled = true; };
   }, [events]);
 
-  return <div className="mapWrap">
-    {!window.L && <div className="notice error">Map library failed to load. Check your connection and reload.</div>}
-    {status && <div className="notice">{status}...</div>}
-    <div className="map" ref={containerRef} />
-  </div>;
+  return (
+    <div className="relative">
+      {!window.L && <div className="mb-3 rounded-md border border-ember/40 bg-ember/10 px-4 py-3 text-sm text-ember">Map library failed to load. Check your connection and reload.</div>}
+      {status && <div className="absolute left-4 top-4 z-[500] rounded-full border border-line bg-canvas/70 px-3 py-1.5 font-mono text-xs text-muted backdrop-blur">{status}…</div>}
+      <div ref={containerRef} className="h-[70vh] min-h-[420px] w-full overflow-hidden rounded-lg border border-line" />
+    </div>
+  );
+}
+
+function Pill({ children, className = '' }) {
+  return <span className={`inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-1 font-mono text-xs text-muted ${className}`}>{children}</span>;
 }
 
 function LoginScreen({ auth }) {
-  return <main className="loginPage">
-    <section className="simpleLogin">
-      <div className="spotifyMark">Spotify Show Finder</div>
-      <div className="card loginCard">
-        <p className="eyebrow">Concerts from your Spotify</p>
-        <h1>Find shows from artists you already listen to.</h1>
-        <p className="lede">Connect your Spotify account and we'll pull your followed artists and liked-song artists, then show upcoming concerts.</p>
-
-        {auth.loading && <div className="notice">Checking Spotify connection...</div>}
-
-        {!auth.loading && !auth.setupReady && <div className="notice error">
-          <strong>Spotify isn't configured yet.</strong>
-          <span>The app is missing server-side Spotify credentials. Add them to your local .env file, restart the server, then come back here.</span>
-        </div>}
-
-        {auth.message && <div className="notice error">{auth.message}</div>}
-
-        <a className={`button loginButton ${!auth.setupReady ? 'disabled' : ''}`} href={`${API}/auth/login`} onClick={e => { if (!auth.setupReady) e.preventDefault(); }}>
-          Continue with Spotify
-        </a>
-
-        <p className="finePrint">We only request permission to read your followed artists and saved tracks. No passwords, no tokens, no developer fields on this page.</p>
+  return (
+    <main className="grid min-h-screen place-items-center px-6">
+      <div className="w-full max-w-xl text-center">
+        <div className="mb-6 inline-flex items-center gap-2 font-display text-lg font-extrabold tracking-tight">
+          <span className="h-3 w-3 rounded-full bg-ember shadow-[0_0_18px_#FF5A3C]" /> Show Finder
+        </div>
+        <div className="rounded-lg border border-line bg-surface/70 p-8 backdrop-blur md:p-12">
+          <p className="font-mono text-xs uppercase tracking-[0.22em] text-teal">Concerts from your Spotify</p>
+          <h1 className="mt-3 font-display text-5xl font-extrabold leading-[0.95] tracking-tight md:text-6xl">
+            Your music,<br /><span className="text-ember">made physical.</span>
+          </h1>
+          <p className="mx-auto mt-5 max-w-md text-lg text-muted">Connect Spotify and we'll map every upcoming show from the artists you actually listen to.</p>
+          {auth.loading && <p className="mt-6 font-mono text-sm text-muted">Checking Spotify connection…</p>}
+          {!auth.loading && !auth.setupReady && (
+            <div className="mt-6 rounded-md border border-ember/40 bg-ember/10 px-4 py-3 text-left text-sm text-ember">
+              <strong className="block">Spotify isn't configured yet.</strong>
+              <span className="text-ember/80">Add server-side Spotify credentials to your .env, restart, and come back.</span>
+            </div>
+          )}
+          {auth.message && <div className="mt-6 rounded-md border border-ember/40 bg-ember/10 px-4 py-3 text-sm text-ember">{auth.message}</div>}
+          <a
+            href={`${API}/auth/login`}
+            onClick={e => { if (!auth.setupReady) e.preventDefault(); }}
+            className={`mt-7 inline-flex items-center gap-2 rounded-full bg-ember px-7 py-3.5 font-semibold text-canvas transition hover:-translate-y-0.5 ${!auth.setupReady ? 'pointer-events-none opacity-50' : ''}`}
+          >
+            <Music2 size={18} /> Continue with Spotify
+          </a>
+          <p className="mx-auto mt-6 max-w-md font-mono text-xs text-muted">We only read your followed artists and saved tracks. No passwords, no tokens.</p>
+        </div>
       </div>
-    </section>
-  </main>;
+    </main>
+  );
+}
+
+function ArtistRail({ artists, selected, toggle }) {
+  if (!artists.length) return null;
+  return (
+    <div className="flex gap-4 overflow-x-auto pb-2">
+      {artists.map((a, i) => {
+        const on = selected.includes(a.id);
+        return (
+          <button key={a.id || a.name} onClick={() => toggle(a.id)} className="w-[84px] flex-none text-center">
+            <div className={`avatar-ring mx-auto grid h-[84px] w-[84px] place-items-center overflow-hidden rounded-full font-display text-3xl font-extrabold ${on ? 'ring-4 ring-ember/30' : ''}`}>
+              {a.image ? <img src={a.image} alt={a.name} loading="lazy" className="h-full w-full rounded-full object-cover" /> : (a.name?.[0] || '?')}
+            </div>
+            <div className="mt-1 font-mono text-[10px] text-ember">#{i + 1}</div>
+            <div className="truncate text-xs text-muted">{a.name}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ShowCard({ e, i }) {
+  const date = `${e.dayLabel ? e.dayLabel.toUpperCase() + ' · ' : ''}${e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}`;
+  const where = [e.venue, e.city, e.country].filter(Boolean).join(', ') || 'Location TBA';
+  return (
+    <motion.a
+      href={e.ticketUrl || e.url} target="_blank" rel="noreferrer"
+      initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.32, ease: 'easeOut', delay: Math.min(i * 0.04, 0.4) }}
+      whileHover={{ y: -3 }}
+      className="group block overflow-hidden rounded-md border border-line bg-surface transition-colors hover:border-ember/50"
+    >
+      {e.image
+        ? <img src={e.image} alt={e.artist} loading="lazy" decoding="async" width="320" height="150" className="h-[150px] w-full object-cover" />
+        : <div className="h-[150px] w-full bg-gradient-to-br from-surface2 to-[#171a22]" />}
+      <div className="p-[18px]">
+        <div className="font-mono text-xs tracking-wide text-ember">{date}</div>
+        <h3 className="mt-1.5 font-display text-xl font-bold tracking-tight">{e.name}</h3>
+        <div className="mt-1 font-mono text-xs text-muted">{where}</div>
+        {e.genres?.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {e.genres.slice(0, 4).map(g => <span key={g} className="rounded-full border border-teal/30 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-teal">{g}</span>)}
+          </div>
+        )}
+        <div className="ticket-stub mt-3.5 flex items-center justify-between pt-3.5">
+          <span className="font-mono text-[11px] text-ink">{e.ticketVendor ? <>{e.onSale ? 'on sale' : 'tickets'} · <b className="text-ember">{e.ticketVendor}</b></> : 'view show'}</span>
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-ember px-3.5 py-2 text-[13px] font-semibold text-canvas">
+            <Ticket size={13} /> Tickets
+          </span>
+        </div>
+      </div>
+    </motion.a>
+  );
 }
 
 function App() {
@@ -145,7 +213,6 @@ function App() {
   const [artists, setArtists] = useState([]);
   const [selected, setSelected] = useState([]);
   const [events, setEvents] = useState([]);
-  const [mocked, setMocked] = useState(false);
   const [loading, setLoading] = useState('');
   const [error, setError] = useState('');
   const [filters, setFilters] = useState({ continent: '', country: '', city: '', radius: '', startDate: '', endDate: '' });
@@ -206,7 +273,6 @@ function App() {
       const list = data.events || [];
       setEvents(list);
       setLoading('');
-      // Background enrich: venue/genres/vendor/coords fill in without blocking.
       if (list.length) {
         fetch(`${API}/concert-detail`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ concerts: list.map(e => ({ id: e.id, url: e.url })) }) })
           .then(readJson)
@@ -222,8 +288,6 @@ function App() {
 
   const visibleArtists = useMemo(() => {
     const query = artistSearch.trim().toLowerCase();
-    // artists arrive ranked by listening affinity from the server; keep that order
-    // within the selected/unselected groups (selected stay on top).
     const rank = new Map(artists.map((a, i) => [a.id, i]));
     return artists
       .filter(artist => !query || String(artist.name || '').toLowerCase().includes(query))
@@ -235,7 +299,6 @@ function App() {
       });
   }, [artists, selected, artistSearch]);
 
-  // Only show shows whose artist is still selected and that fall in the date range.
   const shownEvents = useMemo(() => events.filter(e => {
     if (e.artistId && !selected.includes(e.artistId)) return false;
     const day = String(e.date || '').slice(0, 10);
@@ -244,10 +307,10 @@ function App() {
     return true;
   }), [events, selected, filters.startDate, filters.endDate]);
 
+  function toggleArtist(id) { setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]); }
   function selectVisibleArtists() {
     setSelected(current => [...new Set([...current, ...visibleArtists.map(artist => artist.id).filter(Boolean)])]);
   }
-
   function deselectVisibleArtists() {
     const visibleIds = new Set(visibleArtists.map(artist => artist.id));
     setSelected(current => current.filter(id => !visibleIds.has(id)));
@@ -255,26 +318,92 @@ function App() {
 
   if (!auth.authenticated) return <LoginScreen auth={auth} />;
 
-  return <main>
-    <section className="hero"><div><p className="eyebrow">Connected as {auth.user?.display_name || auth.user?.id}</p><h1>Your Spotify radar</h1><p>Your artists load automatically. Pick the ones you care about, then pull their latest Spotify releases.</p></div><button className="ghost" onClick={() => { localStorage.removeItem('spotify_access_token'); setToken(''); }}>Sign out</button></section>
-    {error && <div className="notice error">{error}</div>}{loading && <div className="notice">{loading}...</div>}
-    <section className="grid"><aside className="card"><h2>Actions</h2><p>This scrapes Spotify's own concert data and formats the results here.</p><button onClick={loadArtists}>Refresh artists</button><button onClick={findConcerts} disabled={!selected.length}>Find Spotify concerts</button>
-      <div className="topSelect"><span>Select top</span>{[20, 40, 50, 100].map(n => <button key={n} className="ghost" disabled={!artists.length} onClick={() => setSelected(artists.slice(0, n).map(a => a.id))}>{n}</button>)}</div>
-      <div className="dateFilter"><label><span>From</span><input type="date" value={filters.startDate} onChange={e => setFilters(f => ({ ...f, startDate: e.target.value }))} /></label><label><span>To</span><input type="date" value={filters.endDate} onChange={e => setFilters(f => ({ ...f, endDate: e.target.value }))} /></label>{(filters.startDate || filters.endDate) && <button className="ghost" onClick={() => setFilters(f => ({ ...f, startDate: '', endDate: '' }))}>Clear dates</button>}</div>
-    </aside><section className="card"><div className="artistHeader"><div><h2>Artists</h2><p>{selected.length} selected. Selected artists stay on top.</p></div><div className="artistTools"><input value={artistSearch} onChange={e => setArtistSearch(e.target.value)} placeholder="Search artists" aria-label="Search artists" /><button className="ghost" onClick={selectVisibleArtists} disabled={!visibleArtists.length}>Select shown</button><button className="ghost" onClick={deselectVisibleArtists} disabled={!visibleArtists.length}>Deselect shown</button></div></div><div className="chips">{visibleArtists.map(a => <button key={a.id || a.name} className={`chip ${selected.includes(a.id) ? 'on' : ''}`} onClick={() => setSelected(s => s.includes(a.id) ? s.filter(x => x !== a.id) : [...s, a.id])}>{a.name}</button>)}</div></section></section>
-    {shownEvents.length > 0 && <div className="viewToggle"><button className={`ghost ${view === 'list' ? 'on' : ''}`} onClick={() => setView('list')}>List</button><button className={`ghost ${view === 'map' ? 'on' : ''}`} onClick={() => setView('map')}>Map</button></div>}
-    {view === 'map'
-      ? <section className="results"><ConcertMap events={shownEvents} /></section>
-      : <section className="results eventGrid">{shownEvents.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}>
-          {e.image && <img className="eventImg" src={e.image} alt={e.artist} loading="lazy" decoding="async" width="320" height="150" />}
-          <span>{e.dayLabel ? `${e.dayLabel} · ` : ''}{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span>
-          <h3>{e.name}</h3>
-          <p>{[e.venue, e.city, e.country].filter(Boolean).join(', ') || 'Location TBA'}</p>
-          <p>{(e.lineup || [e.artist]).join(', ')}</p>
-          {e.genres?.length > 0 && <div className="genres">{e.genres.slice(0, 4).map(g => <span className="genre" key={g}>{g}</span>)}</div>}
-          {e.ticketVendor && <span className="vendor">{e.onSale ? 'On sale' : 'Tickets'} · {e.ticketVendor}</span>}
-        </a>)}</section>}
-  </main>;
+  const inputCls = 'w-full rounded-[10px] border border-line bg-canvas px-3 py-2.5 text-sm text-ink outline-none [color-scheme:dark] focus:border-ember';
+  const ghostCls = 'inline-flex items-center justify-center gap-1.5 rounded-full border border-line px-3 py-2 text-sm text-ink transition hover:border-ember/60 disabled:opacity-40';
+
+  return (
+    <main className="mx-auto w-[min(1180px,94vw)] pb-20 pt-7">
+      {/* Top bar */}
+      <div className="mb-7 flex items-center justify-between">
+        <div className="flex items-center gap-2 font-display text-xl font-extrabold tracking-tight">
+          <span className="h-3 w-3 rounded-full bg-ember shadow-[0_0_18px_#FF5A3C]" /> Show Finder
+        </div>
+        <button onClick={() => { localStorage.removeItem('spotify_access_token'); setToken(''); }} className={ghostCls}>
+          <LogOut size={15} /> {auth.user?.display_name || auth.user?.id}
+        </button>
+      </div>
+
+      {/* Hero */}
+      <section>
+        <p className="font-mono text-xs uppercase tracking-[0.22em] text-teal">your concert radar</p>
+        <h1 className="mt-1.5 font-display text-5xl font-extrabold leading-[0.92] tracking-tight md:text-7xl">
+          Your music, <span className="text-ember">made physical.</span>
+        </h1>
+        <p className="mt-3 max-w-xl text-lg text-muted">The artists you actually listen to — and exactly where to catch them live.</p>
+      </section>
+
+      {error && <div className="mt-5 rounded-md border border-ember/40 bg-ember/10 px-4 py-3 text-sm text-ember">{error}</div>}
+      {loading && <div className="mt-5 rounded-md border border-line bg-surface px-4 py-3 font-mono text-sm text-muted">{loading}…</div>}
+
+      {/* Controls */}
+      <section className="mt-7 grid items-start gap-6 lg:grid-cols-[320px_1fr]">
+        <aside className="rounded-lg border border-line bg-surface/70 p-5 backdrop-blur">
+          <h2 className="font-display text-lg font-bold">Actions</h2>
+          <p className="mt-1 text-sm text-muted">Pick your artists, then pull their upcoming shows.</p>
+          <div className="mt-4 grid gap-2">
+            <button onClick={loadArtists} className={ghostCls}><RefreshCw size={15} /> Refresh artists</button>
+            <button onClick={findConcerts} disabled={!selected.length} className="inline-flex items-center justify-center gap-2 rounded-full bg-ember px-4 py-2.5 font-semibold text-canvas transition hover:-translate-y-0.5 disabled:translate-y-0 disabled:opacity-40">
+              <MapPin size={16} /> Find concerts
+            </button>
+          </div>
+          <div className="mt-4">
+            <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted">Select top</div>
+            <div className="mt-2 flex gap-1.5">
+              {[20, 40, 50, 100].map(n => <button key={n} disabled={!artists.length} onClick={() => setSelected(artists.slice(0, n).map(a => a.id))} className={`flex-1 ${ghostCls}`}>{n}</button>)}
+            </div>
+          </div>
+          <div className="mt-4 grid gap-2.5 border-t border-line pt-4">
+            <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted flex items-center gap-1.5"><CalendarDays size={13} /> Date range</div>
+            <label className="grid gap-1"><span className="font-mono text-[11px] text-muted">From</span><input type="date" value={filters.startDate} onChange={e => setFilters(f => ({ ...f, startDate: e.target.value }))} className={inputCls} /></label>
+            <label className="grid gap-1"><span className="font-mono text-[11px] text-muted">To</span><input type="date" value={filters.endDate} onChange={e => setFilters(f => ({ ...f, endDate: e.target.value }))} className={inputCls} /></label>
+            {(filters.startDate || filters.endDate) && <button onClick={() => setFilters(f => ({ ...f, startDate: '', endDate: '' }))} className={ghostCls}><X size={14} /> Clear dates</button>}
+          </div>
+        </aside>
+
+        <section className="rounded-lg border border-line bg-surface/70 p-5 backdrop-blur">
+          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h2 className="font-display text-lg font-bold">Your artists</h2>
+              <p className="font-mono text-xs text-muted">{selected.length} selected · ranked by listening</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+                <input value={artistSearch} onChange={e => setArtistSearch(e.target.value)} placeholder="Search" aria-label="Search artists" className={`${inputCls} pl-8`} />
+              </div>
+              <button onClick={selectVisibleArtists} disabled={!visibleArtists.length} className={`${ghostCls} whitespace-nowrap`}>Select shown</button>
+              <button onClick={deselectVisibleArtists} disabled={!visibleArtists.length} className={`${ghostCls} whitespace-nowrap`}>Clear shown</button>
+            </div>
+          </div>
+          <ArtistRail artists={visibleArtists} selected={selected} toggle={toggleArtist} />
+        </section>
+      </section>
+
+      {/* Results */}
+      {shownEvents.length > 0 && (
+        <div className="mt-8 inline-flex gap-2 rounded-full border border-line bg-surface p-1">
+          <button onClick={() => setView('list')} className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm transition ${view === 'list' ? 'bg-ember text-canvas' : 'text-muted hover:text-ink'}`}><List size={15} /> List</button>
+          <button onClick={() => setView('map')} className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm transition ${view === 'map' ? 'bg-ember text-canvas' : 'text-muted hover:text-ink'}`}><MapIcon size={15} /> Map</button>
+        </div>
+      )}
+
+      <section className="mt-5">
+        {view === 'map'
+          ? <ConcertMap events={shownEvents} />
+          : <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} />)}</div>}
+      </section>
+    </main>
+  );
 }
 
 createRoot(document.getElementById('root')).render(<App />);
