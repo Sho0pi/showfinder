@@ -281,10 +281,27 @@ function App() {
       setArtists(list);
       const ids = list.map(a => a.id).filter(Boolean);
       if (!ids.length) { setLoading(''); return; }
-      setLoading(`Finding shows for ${ids.length} artists`);
-      const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: ids }) }).then(readJson);
       enrichedRef.current = new Set();
-      setEvents(res.events || []);
+      setEvents([]);
+      // Stream the show lists in small chunks with a client-side pool so the
+      // count badges fill in progressively instead of waiting for everyone.
+      const CHUNK = 6, POOL = 4;
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK));
+      let next = 0, done = 0;
+      setLoading(`Finding shows (0/${ids.length})`);
+      async function worker() {
+        while (next < chunks.length) {
+          const chunk = chunks[next++];
+          try {
+            const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: chunk }) }).then(readJson);
+            if (res.events?.length) setEvents(cur => [...cur, ...res.events]);
+          } catch {}
+          done += chunk.length;
+          setLoading(done < ids.length ? `Finding shows (${done}/${ids.length})` : '');
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(POOL, chunks.length) }, () => worker()));
     } catch (e) { setError(e.message); }
     finally { setLoading(''); }
   }
