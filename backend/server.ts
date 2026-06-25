@@ -485,6 +485,7 @@ async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
   const ids = artistIds.slice(0, 400);
   let events: any[] = [];
   let source = 'spotify-pathfinder';
+  let fastPathFailed = false;
   try {
     // Pathfinder gives the shows (and the artist name); images come from the lazy
     // detail enrich and the frontend's artist list — so NO per-chunk /v1/artists
@@ -498,10 +499,13 @@ async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
     );
     events = perArtist.flat();
   } catch (error) {
+    // Only a token-harvest failure means the fast path is actually broken.
+    fastPathFailed = true;
     logAuth('fast_path_failed', { message: error instanceof Error ? error.message : 'fast path failed' });
   }
-  // Fallback to the browser scrape if the fast path produced nothing.
-  if (!events.length) {
+  // Browser fallback ONLY when the fast path itself broke — NOT when an artist
+  // simply has zero upcoming shows (that would launch a browser per empty artist).
+  if (fastPathFailed) {
     source = 'spotify-page-scrape';
     events = await getConcertsViaBrowser(accessToken, ids);
   }

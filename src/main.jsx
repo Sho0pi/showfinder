@@ -226,6 +226,7 @@ function App() {
   const [selected, setSelected] = useState([]);
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState('');
+  const [progress, setProgress] = useState(null);
   const [error, setError] = useState('');
   const [filters, setFilters] = useState({ continent: '', country: '', city: '', radius: '', startDate: '', endDate: '' });
   const [artistSearch, setArtistSearch] = useState('');
@@ -288,7 +289,8 @@ function App() {
       // badge appears the instant its own request resolves.
       const POOL = 10;
       let next = 0, done = 0;
-      setLoading(`Finding shows (0/${ids.length})`);
+      setLoading('');
+      setProgress({ done: 0, total: ids.length });
       async function worker() {
         while (next < ids.length) {
           const id = ids[next++];
@@ -300,12 +302,13 @@ function App() {
             }
           } catch {}
           done++;
-          setLoading(done < ids.length ? `Finding shows (${done}/${ids.length})` : '');
+          setProgress({ done, total: ids.length });
         }
       }
       await Promise.all(Array.from({ length: Math.min(POOL, ids.length) }, () => worker()));
+      setProgress(null);
     } catch (e) { setError(e.message); }
-    finally { setLoading(''); }
+    finally { setLoading(''); setProgress(null); }
   }
 
   useEffect(() => {
@@ -397,6 +400,17 @@ function App() {
 
       {error && <div className="mt-5 rounded-md border border-ember/40 bg-ember/10 px-4 py-3 text-sm text-ember">{error}</div>}
       {loading && <div className="mt-5 rounded-md border border-line bg-surface px-4 py-3 font-mono text-sm text-muted">{loading}…</div>}
+      {progress && (
+        <div className="mt-5 rounded-md border border-line bg-surface px-4 py-3">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-ink">Scanning your library for upcoming shows</span>
+            <span className="font-mono text-xs text-muted">{progress.done} / {progress.total} artists</span>
+          </div>
+          <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-canvas">
+            <div className="h-full rounded-full bg-ember transition-[width] duration-200" style={{ width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%` }} />
+          </div>
+        </div>
+      )}
 
       {/* Controls */}
       <section className="mt-7 grid items-start gap-6 lg:grid-cols-[320px_1fr]">
