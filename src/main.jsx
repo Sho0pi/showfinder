@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { motion } from 'framer-motion';
-import { Music2, MapPin, LogOut, Search, CalendarDays, List, Map as MapIcon, Ticket, RefreshCw, X } from 'lucide-react';
+import { Music2, MapPin, LogOut, Search, CalendarDays, Ticket, RefreshCw, X, Check } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_BASE || '/api';
@@ -156,16 +156,22 @@ function LoginScreen({ auth }) {
 function ArtistRail({ artists, selected, toggle }) {
   if (!artists.length) return null;
   return (
-    <div className="flex gap-4 overflow-x-auto pb-2">
+    <div className="flex max-h-[300px] flex-wrap gap-x-4 gap-y-5 overflow-y-auto pr-1">
       {artists.map((a, i) => {
         const on = selected.includes(a.id);
         return (
-          <button key={a.id || a.name} onClick={() => toggle(a.id)} className="w-[84px] flex-none text-center">
-            <div className={`avatar-ring mx-auto grid h-[84px] w-[84px] place-items-center overflow-hidden rounded-full font-display text-3xl font-extrabold ${on ? 'ring-4 ring-ember/30' : ''}`}>
-              {a.image ? <img src={a.image} alt={a.name} loading="lazy" className="h-full w-full rounded-full object-cover" /> : (a.name?.[0] || '?')}
+          <button
+            key={a.id || a.name}
+            onClick={() => toggle(a.id)}
+            aria-pressed={on}
+            className={`w-[78px] flex-none text-center transition ${on ? '' : 'opacity-50 hover:opacity-100'}`}
+          >
+            <div className={`relative mx-auto grid h-[78px] w-[78px] place-items-center overflow-hidden rounded-full bg-surface2 font-display text-2xl font-extrabold text-muted ${on ? 'shadow-[0_0_0_3px_var(--color-ember)]' : 'shadow-[0_0_0_1px_var(--color-line)]'}`}>
+              {a.image ? <img src={a.image} alt={a.name} loading="lazy" className="h-full w-full object-cover" /> : (a.name?.[0] || '?')}
+              {on && <span className="absolute -bottom-0.5 -right-0.5 grid h-6 w-6 place-items-center rounded-full border-2 border-surface bg-ember text-canvas"><Check size={13} strokeWidth={3} /></span>}
             </div>
-            <div className="mt-1 font-mono text-[10px] text-ember">#{i + 1}</div>
-            <div className="truncate text-xs text-muted">{a.name}</div>
+            <div className={`mt-1.5 font-mono text-[10px] ${on ? 'text-ember' : 'text-muted'}`}>#{i + 1}</div>
+            <div className={`truncate text-xs ${on ? 'font-semibold text-ink' : 'text-muted'}`}>{a.name}</div>
           </button>
         );
       })}
@@ -217,7 +223,6 @@ function App() {
   const [error, setError] = useState('');
   const [filters, setFilters] = useState({ continent: '', country: '', city: '', radius: '', startDate: '', endDate: '' });
   const [artistSearch, setArtistSearch] = useState('');
-  const [view, setView] = useState('list');
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -389,19 +394,21 @@ function App() {
         </section>
       </section>
 
-      {/* Results */}
+      {/* Results — map always on top, cards below */}
       {shownEvents.length > 0 && (
-        <div className="mt-8 inline-flex gap-2 rounded-full border border-line bg-surface p-1">
-          <button onClick={() => setView('list')} className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm transition ${view === 'list' ? 'bg-ember text-canvas' : 'text-muted hover:text-ink'}`}><List size={15} /> List</button>
-          <button onClick={() => setView('map')} className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm transition ${view === 'map' ? 'bg-ember text-canvas' : 'text-muted hover:text-ink'}`}><MapIcon size={15} /> Map</button>
-        </div>
+        <>
+          <section className="mt-8">
+            <div className="mb-3 flex items-baseline gap-2">
+              <h2 className="font-display text-lg font-bold">On the map</h2>
+              <span className="font-mono text-xs text-muted">{shownEvents.length} {shownEvents.length === 1 ? 'show' : 'shows'}</span>
+            </div>
+            <ConcertMap events={shownEvents} />
+          </section>
+          <section className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+            {shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} />)}
+          </section>
+        </>
       )}
-
-      <section className="mt-5">
-        {view === 'map'
-          ? <ConcertMap events={shownEvents} />
-          : <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} />)}</div>}
-      </section>
     </main>
   );
 }
