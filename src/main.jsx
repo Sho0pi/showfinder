@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { motion } from 'framer-motion';
-import { Music2, MapPin, LogOut, Search, CalendarDays, Ticket, RefreshCw, X, Check } from 'lucide-react';
+import { Music2, MapPin, LogOut, Search, CalendarDays, Ticket, RefreshCw, X, Check, Filter } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_BASE || '/api';
@@ -230,6 +230,7 @@ function App() {
   const [error, setError] = useState('');
   const [filters, setFilters] = useState({ continent: '', country: '', city: '', radius: '', startDate: '', endDate: '' });
   const [artistSearch, setArtistSearch] = useState('');
+  const [hideEmpty, setHideEmpty] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -315,18 +316,26 @@ function App() {
     if (auth.authenticated && token && !artists.length && !loading) loadEverything();
   }, [auth.authenticated, token]);
 
+  // Upcoming-show count per artist (from the prefetched list) for the rail badges.
+  const countByArtist = useMemo(() => {
+    const m = {};
+    for (const e of events) if (e.artistId) m[e.artistId] = (m[e.artistId] || 0) + 1;
+    return m;
+  }, [events]);
+
   const visibleArtists = useMemo(() => {
     const query = artistSearch.trim().toLowerCase();
     const rank = new Map(artists.map((a, i) => [a.id, i]));
     return artists
       .filter(artist => !query || String(artist.name || '').toLowerCase().includes(query))
+      .filter(artist => !hideEmpty || (countByArtist[artist.id] || 0) > 0)
       .sort((a, b) => {
         const aSelected = selected.includes(a.id) ? 0 : 1;
         const bSelected = selected.includes(b.id) ? 0 : 1;
         if (aSelected !== bSelected) return aSelected - bSelected;
         return (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0);
       });
-  }, [artists, selected, artistSearch]);
+  }, [artists, selected, artistSearch, hideEmpty, countByArtist]);
 
   const shownEvents = useMemo(() => events.filter(e => {
     if (e.artistId && !selected.includes(e.artistId)) return false;
@@ -335,13 +344,6 @@ function App() {
     if (filters.endDate && (!day || day > filters.endDate)) return false;
     return true;
   }), [events, selected, filters.startDate, filters.endDate]);
-
-  // Upcoming-show count per artist (from the prefetched list) for the rail badges.
-  const countByArtist = useMemo(() => {
-    const m = {};
-    for (const e of events) if (e.artistId) m[e.artistId] = (m[e.artistId] || 0) + 1;
-    return m;
-  }, [events]);
 
   // Lazily enrich (venue/genres/vendor/coords) only the shows currently shown.
   const enrichedRef = React.useRef(new Set());
@@ -447,6 +449,7 @@ function App() {
               </div>
               <button onClick={selectVisibleArtists} disabled={!visibleArtists.length} className={`${ghostCls} whitespace-nowrap`}>Select shown</button>
               <button onClick={deselectVisibleArtists} disabled={!visibleArtists.length} className={`${ghostCls} whitespace-nowrap`}>Clear shown</button>
+              <button onClick={() => setHideEmpty(v => !v)} aria-pressed={hideEmpty} className={`inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-full px-3 py-2 text-sm transition ${hideEmpty ? 'bg-ember text-canvas' : 'border border-line text-ink hover:border-ember/60'}`}><Filter size={14} /> Hide empty</button>
             </div>
           </div>
           <ArtistRail artists={visibleArtists} selected={selected} toggle={toggleArtist} counts={countByArtist} />
