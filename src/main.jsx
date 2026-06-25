@@ -49,7 +49,7 @@ const CORAL_ICON = () => window.L.divIcon({
   iconSize: [18, 18], iconAnchor: [9, 18], popupAnchor: [0, -18]
 });
 
-function ConcertMap({ events }) {
+function ConcertMap({ events, nameById }) {
   const containerRef = React.useRef(null);
   const mapRef = React.useRef(null);
   const layerRef = React.useRef(null);
@@ -87,13 +87,22 @@ function ConcertMap({ events }) {
         const coords = hasCoords ? { lat: event.lat, lon: event.lon } : await geocodeCity(event.city, cache);
         if (cancelled) return;
         if (!coords) continue;
+        const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
         const when = `${event.dayLabel ? event.dayLabel + ' ' : ''}${event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA'}`;
+        const artistName = (nameById && nameById.get(event.artistId)) || '';
         const lineupArr = (event.lineup || [event.artist]).filter(Boolean);
-        const lineup = lineupArr.slice(0, 6).join(', ') + (lineupArr.length > 6 ? ` +${lineupArr.length - 6} more` : '');
-        const where = [event.venue, event.city, event.country].filter(Boolean).join(', ') || 'Location TBA';
-        const vendor = event.ticketVendor ? `<br><em style="color:#8B8389">${event.onSale ? 'On sale' : 'Tickets'} · ${event.ticketVendor}</em>` : '';
-        const img = event.image ? `<img src="${event.image}" alt="" style="width:100%;height:96px;object-fit:cover;border-radius:8px;margin-bottom:8px">` : '';
-        const popup = `${img}<strong style="font-family:'Cabinet Grotesk',sans-serif;font-size:16px">${event.name || event.artist}</strong><br><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#FF5A3C">${when}</span><br><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#8B8389">${where}</span><br><span style="font-size:13px">${lineup}</span>${vendor}<br><a href="${event.ticketUrl || event.url}" target="_blank" rel="noreferrer">Tickets →</a>`;
+        const isMulti = lineupArr.length > 1;
+        // Festivals dump the full lineup into the title — give a short headline.
+        const titleIsLineup = isMulti && (event.name || '').length > 36;
+        const headline = titleIsLineup ? (event.venue || `${artistName || lineupArr[0]} + ${lineupArr.length - 1} more`) : (event.name || event.artist);
+        const ordered = artistName ? [artistName, ...lineupArr.filter(n => n !== artistName)] : lineupArr;
+        const lineupStr = ordered.slice(0, 6).join(' · ') + (ordered.length > 6 ? ` +${ordered.length - 6} more` : '');
+        const where = (titleIsLineup ? [event.city, event.country] : [event.venue, event.city, event.country]).filter(Boolean).join(', ') || 'Location TBA';
+        const badge = artistName ? `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#FF5A3C;margin-bottom:4px">♪ ${esc(artistName)}</div>` : '';
+        const lineupLine = isMulti ? `<br><span style="font-size:12px;color:#8B8389"><b style="color:#F4EFEA">+${lineupArr.length} acts:</b> ${esc(lineupStr)}</span>` : '';
+        const vendor = event.ticketVendor ? `<br><em style="color:#8B8389">${event.onSale ? 'On sale' : 'Tickets'} · ${esc(event.ticketVendor)}</em>` : '';
+        const img = event.image ? `<img src="${esc(event.image)}" alt="" style="width:100%;height:96px;object-fit:cover;border-radius:8px;margin-bottom:8px">` : '';
+        const popup = `${img}${badge}<strong style="font-family:'Cabinet Grotesk',sans-serif;font-size:16px">${esc(headline)}</strong><br><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#FF5A3C">${esc(when)}</span><br><span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#8B8389">${esc(where)}</span>${lineupLine}${vendor}<br><a href="${esc(event.ticketUrl || event.url)}" target="_blank" rel="noreferrer">Tickets →</a>`;
         window.L.marker([coords.lat, coords.lon], { icon: CORAL_ICON() }).bindPopup(popup).addTo(layer);
         bounds.push([coords.lat, coords.lon]);
         placed++;
@@ -105,7 +114,7 @@ function ConcertMap({ events }) {
     }
     plot();
     return () => { cancelled = true; };
-  }, [events]);
+  }, [events, nameById]);
 
   return (
     <div className="relative">
@@ -577,7 +586,7 @@ function App() {
               <span className="font-mono text-xs text-muted">{shownEvents.length} {shownEvents.length === 1 ? 'show' : 'shows'}</span>
             </div>
             <RegionBar regionSet={regionSet} setRegionSet={setRegionSet} />
-            <ConcertMap events={shownEvents} />
+            <ConcertMap events={shownEvents} nameById={nameById} />
           </section>
           {shownEvents.length > 0
             ? <section className="mt-6 grid auto-rows-fr gap-5 sm:grid-cols-2 lg:grid-cols-3">{shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} artistName={nameById.get(e.artistId)} />)}</section>
