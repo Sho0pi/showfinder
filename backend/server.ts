@@ -1,0 +1,377 @@
+const PORT = Number(Bun.env.PORT || Bun.env.API_PORT || 45678);
+const SPOTIFY_CLIENT_ID = Bun.env.SPOTIFY_CLIENT_ID || '';
+const SPOTIFY_CLIENT_SECRET = Bun.env.SPOTIFY_CLIENT_SECRET || '';
+const SPOTIFY_REDIRECT_URI = Bun.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:45678/callback';
+const SPOTIFY_SP_DC = Bun.env.SPOTIFY_SP_DC || '';
+const DIST_DIR = new URL('../dist/', import.meta.url);
+
+const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
+  status,
+  headers: { 'content-type': 'application/json' }
+});
+
+function logAuth(event: string, details: Record<string, unknown> = {}) {
+  const safeDetails = { ...details };
+  for (const key of Object.keys(safeDetails)) {
+    if (key.toLowerCase().includes('token') || key.toLowerCase().includes('secret') || key.toLowerCase().includes('code')) {
+      safeDetails[key] = '[redacted]';
+    }
+  }
+  console.log(`[auth] ${new Date().toISOString()} ${event}`, JSON.stringify(safeDetails));
+}
+
+const mimeTypes: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+};
+
+function contentType(pathname: string) {
+  const match = pathname.match(/\.[^.]+$/);
+  return match ? mimeTypes[match[0]] || 'application/octet-stream' : 'application/octet-stream';
+}
+
+async function serveStatic(pathname: string) {
+  const safePath = pathname === '/' ? '/index.html' : pathname;
+  const decoded = decodeURIComponent(safePath);
+  if (decoded.includes('..')) return json({ error: 'Bad path' }, 400);
+
+  const file = Bun.file(new URL(`.${decoded}`, DIST_DIR));
+  if (await file.exists()) {
+    return new Response(file, { headers: { 'content-type': contentType(decoded) } });
+  }
+
+  const index = Bun.file(new URL('./index.html', DIST_DIR));
+  if (await index.exists()) {
+    return new Response(index, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+  }
+
+  return json({ error: 'Frontend build not found. Run bun run build first.' }, 404);
+}
+
+const mockEvents = (artists: string[]) => artists.slice(0, 12).map((artist, i) => ({
+  id: `mock-${artist}-${i}`,
+  artist,
+  name: `${artist} Live`,
+  date: new Date(Date.now() + (i + 7) * 86400000).toISOString().slice(0, 10),
+  venue: ['The Fillmore', 'Roundhouse', 'Olympia Theatre', 'Forum'][i % 4],
+  city: ['New York', 'London', 'Paris', 'Sydney'][i % 4],
+  country: ['US', 'GB', 'FR', 'AU'][i % 4],
+  continent: ['North America', 'Europe', 'Europe', 'Oceania'][i % 4],
+  url: 'https://www.ticketmaster.com/',
+  source: 'mock'
+}));
+
+async function spotify(path: string, accessToken: string) {
+  const res = await fetch(`https://api.spotify.com/v1${path}`, {
+    headers: { authorization: `Bearer ${accessToken}` }
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function getFollowedArtists(accessToken: string) {
+  const artists = [];
+  let after = '';
+  do {
+    const data = await spotify(`/me/following?type=artist&limit=50${after ? `&after=${after}` : ''}`, accessToken);
+    artists.push(...(data.artists?.items || []));
+    after = data.artists?.cursors?.after || '';
+  } while (after && artists.length < 500);
+  return artists;
+}
+
+async function getLikedSongArtists(accessToken: string) {
+  const map = new Map();
+  let offset = 0;
+  while (offset < 500) {
+    const data = await spotify(`/me/tracks?limit=50&offset=${offset}`, accessToken);
+    for (const item of data.items || []) {
+      for (const artist of item.track?.artists || []) map.set(artist.id || artist.name, artist);
+    }
+    if (!data.next) break;
+    offset += 50;
+  }
+  return [...map.values()];
+}
+
+function stripHtml(value: string) {
+  return value.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+const WEB_TOKEN_SECRET_BYTES = [12, 56, 76, 33, 88, 44, 88, 33, 78, 78, 11, 66, 22, 22, 55, 69, 54];
+const WEB_TOKEN_VERSION = 5;
+let cachedWebToken: { token: string; expiresAt: number } | null = null;
+
+function base32(bytes: Uint8Array) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0, value = 0, output = '';
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
+  return output;
+}
+
+async function hmacSha1(key: Uint8Array, message: Uint8Array) {
+  const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, message));
+}
+
+function base32Decode(input: string) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0, value = 0;
+  const output = [];
+  for (const char of input.replace(/=+$/, '')) {
+    const index = alphabet.indexOf(char.toUpperCase());
+    if (index < 0) continue;
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      output.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(output);
+}
+
+async function makeTotp(serverSeconds: number) {
+  const transformed = WEB_TOKEN_SECRET_BYTES.map((value, index) => value ^ ((index % 33) + 9));
+  const hexString = Array.from(new TextEncoder().encode(transformed.join(''))).map(b => b.toString(16).padStart(2, '0')).join('');
+  const bytes = new Uint8Array(hexString.match(/.{2}/g)!.map(x => parseInt(x, 16)));
+  const key = base32Decode(base32(bytes));
+  const counter = Math.floor(serverSeconds / 30);
+  const msg = new Uint8Array(8);
+  new DataView(msg.buffer).setUint32(4, counter);
+  const hmac = await hmacSha1(key, msg);
+  const offset = hmac[hmac.length - 1] & 15;
+  const code = ((hmac[offset] & 127) << 24) | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3];
+  return String(code % 1000000).padStart(6, '0');
+}
+
+async function getSpotifyWebToken(forceRefresh = false) {
+  if (!forceRefresh && cachedWebToken && cachedWebToken.expiresAt > Date.now() + 60000) return cachedWebToken.token;
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const timeRes = await fetch('https://open.spotify.com/api/server-time', { headers: { 'user-agent': ua, accept: 'application/json' } });
+  const timeData = await timeRes.json().catch(() => ({}));
+  const serverSeconds = Number(timeData.serverTime || Math.floor(Date.now() / 1000));
+  const totp = await makeTotp(serverSeconds);
+  const params = new URLSearchParams({
+    reason: 'transport',
+    productType: 'web-player',
+    totp,
+    totpServer: totp,
+    totpVer: String(WEB_TOKEN_VERSION),
+    sTime: String(serverSeconds),
+    cTime: String(serverSeconds)
+  });
+  const headers: Record<string, string> = { 'user-agent': ua, accept: 'application/json', referer: 'https://open.spotify.com/', 'app-platform': 'WebPlayer' };
+  if (SPOTIFY_SP_DC) headers.cookie = `sp_dc=${SPOTIFY_SP_DC}`;
+  const res = await fetch(`https://open.spotify.com/get_access_token?${params}`, { headers });
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`Spotify web token failed ${res.status}: ${raw.slice(0, 120)}`);
+  const data = JSON.parse(raw);
+  if (!data.accessToken) throw new Error(`Spotify web token response missing accessToken: ${raw.slice(0, 120)}`);
+  cachedWebToken = { token: data.accessToken, expiresAt: Number(data.accessTokenExpirationTimestampMs || Date.now() + 600000) };
+  return cachedWebToken.token;
+}
+
+async function scrapeSpotifyConcertPage(artist: any) {
+  const { chromium } = await import('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' });
+    const artistUrl = `https://open.spotify.com/artist/${artist.id}/concerts`;
+    await page.goto(artistUrl, { waitUntil: 'networkidle', timeout: 60000 });
+    await page.waitForSelector('a[data-testid="concert-row"], a[href^="/concert/"]', { timeout: 20000 }).catch(() => null);
+    await page.waitForTimeout(1500);
+    const rows = await page.evaluate((artistName) => {
+      return Array.from(document.querySelectorAll('a[data-testid="concert-row"], a[href^="/concert/"]')).map((row) => {
+        const link = row as HTMLAnchorElement;
+        const time = row.querySelector('time') as HTMLTimeElement | null;
+        const parts = ((row as HTMLElement).innerText || row.textContent || '').split('\n').map(part => part.trim()).filter(Boolean);
+        const city = parts.find(part => !/^[A-Z][a-z]{2}$/.test(part) && !/^\d{1,2}$/.test(part) && part !== artistName && !/^\d{1,2}:\d{2}\s?(AM|PM)$/i.test(part)) || '';
+        const href = link.href || link.getAttribute('href') || '';
+        const id = href.split('/concert/')[1]?.split(/[?#]/)[0] || href;
+        return {
+          id,
+          artist: artistName,
+          name: artistName,
+          date: time?.dateTime || '',
+          city,
+          lineup: [artistName],
+          type: 'Spotify concert',
+          url: href.startsWith('http') ? href : `https://open.spotify.com${href}`,
+          source: 'spotify-page-scrape'
+        };
+      });
+    }, artist.name);
+    return rows.map((event: any) => ({ ...event, artistUrl }));
+  } finally {
+    await browser.close();
+  }
+}
+
+async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
+  const events = [];
+  let webToken = '';
+  try { webToken = await getSpotifyWebToken(); }
+  catch (error) { logAuth('spotify_web_token_unavailable', { message: error instanceof Error ? error.message : 'Token failed' }); }
+  for (const artistId of artistIds.slice(0, 25)) {
+    const artist = await spotify(`/artists/${artistId}`, accessToken);
+    const concertsUrl = `https://open.spotify.com/artist/${artistId}/concerts`;
+    try {
+      if (!webToken) throw new Error('Spotify web token unavailable');
+      const queryBody = JSON.stringify({ variables: { artistUri: `spotify:artist:${artistId}`, geoHash: null, includeNearby: false }, operationName: 'ArtistConcerts', extensions: { persistedQuery: { version: 1, sha256Hash: 'ef53c43b865496b9890b7167eab1dc614a8949ef9451b3c41184ea888de8bd2b' } } });
+      let res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${webToken}`, accept: 'application/json', 'content-type': 'application/json;charset=UTF-8', 'app-platform': 'WebPlayer' },
+        body: queryBody
+      });
+      if (res.status === 401 || res.status === 403) {
+        webToken = await getSpotifyWebToken(true);
+        res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', {
+          method: 'POST',
+          headers: { authorization: `Bearer ${webToken}`, accept: 'application/json', 'content-type': 'application/json;charset=UTF-8', 'app-platform': 'WebPlayer' },
+          body: queryBody
+        });
+      }
+      const raw = await res.text();
+      const data = JSON.parse(raw || '{}');
+      if (!res.ok) throw new Error(data?.errors?.[0]?.message || `Spotify partner API ${res.status}`);
+      for (const item of data?.data?.concerts?.concerts?.items || []) {
+        const concert = item.data;
+        const concertId = concert.uri?.split(':').pop() || `${artistId}-${concert.startDateIsoString}`;
+        events.push({ id: concertId, artist: artist.name, name: concert.title || artist.name, date: concert.startDateIsoString, city: concert.location?.city || '', lineup: (concert.artists?.items || []).map((a: any) => a.data?.profile?.name).filter(Boolean), type: 'Spotify concert', url: `https://open.spotify.com/concert/${concertId}`, artistUrl: concertsUrl, source: 'spotify-web-token' });
+      }
+    } catch (error) {
+      logAuth('spotify_concert_scrape_error', { artistId, message: error instanceof Error ? error.message : 'Fetch failed' });
+      try {
+        events.push(...await scrapeSpotifyConcertPage(artist));
+      } catch (fallbackError) {
+        logAuth('concert_fallback_error', { artistId, message: fallbackError instanceof Error ? fallbackError.message : 'Fallback failed' });
+      }
+    }
+  }
+  events.sort((a: any, b: any) => String(a.date || '').localeCompare(String(b.date || '')));
+  return { events, source: 'spotify-page-scrape', message: events.length ? '' : 'No Spotify concerts were returned for the selected artists.' };
+}
+
+Bun.serve({
+  port: PORT,
+  idleTimeout: 120,
+  async fetch(req) {
+    const url = new URL(req.url);
+    try {
+      if (url.pathname === '/api/config') return json({
+        clientId: SPOTIFY_CLIENT_ID,
+        redirectUri: SPOTIFY_REDIRECT_URI,
+        ready: Boolean(SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET && SPOTIFY_REDIRECT_URI),
+        missing: ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'SPOTIFY_REDIRECT_URI'].filter(key => !Bun.env[key])
+      });
+      if (url.pathname === '/api/test/spotify-scrape') {
+        const ids = (url.searchParams.get('ids') || '0jq1z5MQSlFtvpbnLzeEul,7jLSEPYCYQ5ssWU3BICqrW,6L1oTvVHQOHmsmoVewQpuB').split(',').map(id => id.trim()).filter(Boolean);
+        const results = [];
+        for (const id of ids.slice(0, 5)) {
+          const artist = { id, name: url.searchParams.get(`name_${id}`) || id };
+          results.push({ artist, events: await scrapeSpotifyConcertPage(artist) });
+        }
+        return json({ results });
+      }
+      if (url.pathname === '/api/test/jazzbois' || url.pathname === '/jazzbois-test') {
+        const artist = { id: '0jq1z5MQSlFtvpbnLzeEul', name: 'Jazzbois' };
+        const events = await scrapeSpotifyConcertPage(artist);
+        events.sort((a: any, b: any) => String(a.date || '').localeCompare(String(b.date || '')));
+        if (url.pathname === '/api/test/jazzbois') return json({ artist, events, count: events.length });
+        return new Response(`<!doctype html><html><head><title>Jazzbois concert test</title><style>body{font-family:Inter,Arial,sans-serif;background:#101010;color:#fff;margin:0;padding:32px}.card{max-width:920px;margin:auto;background:#181818;border:1px solid #333;border-radius:24px;padding:28px}h1{margin:0 0 8px}.ok{color:#1ed760;font-weight:700}.event{padding:16px 0;border-top:1px solid #303030}.date{color:#1ed760}.muted{color:#aaa}</style></head><body><main class="card"><p class="ok">Verified working</p><h1>Jazzbois concrete concert list</h1><p class="muted">${events.length} events found for Spotify artist ${artist.id}</p>${events.map((event: any) => `<div class="event"><div class="date">${new Date(event.date).toLocaleString()}</div><h2>${event.name}</h2><p>${event.city}${event.venue ? `, ${event.venue}` : ''}</p><a href="${event.url}" style="color:#1ed760">Tickets</a></div>`).join('')}</main></body></html>`, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+      }
+      if (url.pathname === '/api/auth/login') {
+        logAuth('login_start', { origin: url.origin, redirectUri: SPOTIFY_REDIRECT_URI, hasClientId: Boolean(SPOTIFY_CLIENT_ID), hasClientSecret: Boolean(SPOTIFY_CLIENT_SECRET) });
+        if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !SPOTIFY_REDIRECT_URI) {
+          logAuth('login_blocked_missing_config', { missing: ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'SPOTIFY_REDIRECT_URI'].filter(key => !Bun.env[key]) });
+          return json({ error: 'Spotify OAuth is not configured. Add the required Spotify variables to your local .env, then restart the server.' }, 503);
+        }
+        const params = new URLSearchParams({
+          client_id: SPOTIFY_CLIENT_ID,
+          response_type: 'code',
+          redirect_uri: SPOTIFY_REDIRECT_URI,
+          scope: 'user-follow-read user-library-read',
+          show_dialog: 'true'
+        });
+        return Response.redirect(`https://accounts.spotify.com/authorize?${params}`, 302);
+      }
+      if (url.pathname === '/api/auth/callback' || url.pathname === '/callback') {
+        if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !SPOTIFY_REDIRECT_URI) {
+          return json({ error: 'Spotify OAuth is not configured. Add the required Spotify variables to your local .env, then restart the server.' }, 503);
+        }
+        const code = url.searchParams.get('code');
+        const error = url.searchParams.get('error');
+        const appUrl = url.origin;
+        logAuth('callback_received', { origin: url.origin, hasCode: Boolean(code), error, redirectUri: SPOTIFY_REDIRECT_URI });
+        if (error) {
+          logAuth('callback_spotify_error', { error });
+          return Response.redirect(`${appUrl}/callback?error=${encodeURIComponent(error)}`, 302);
+        }
+        if (!code) return serveStatic('/');
+        const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: SPOTIFY_REDIRECT_URI });
+        const basic = btoa(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`);
+        const res = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { authorization: `Basic ${basic}`, 'content-type': 'application/x-www-form-urlencoded' }, body });
+        const data = await res.json();
+        if (!res.ok) {
+          logAuth('token_exchange_failed', { status: res.status, spotifyError: data.error, spotifyDescription: data.error_description });
+          return json(data, res.status);
+        }
+        logAuth('token_exchange_ok', { status: res.status, expiresIn: data.expires_in, scope: data.scope });
+        return Response.redirect(`${appUrl}/callback?access_token=${encodeURIComponent(data.access_token)}`, 302);
+      }
+      if (url.pathname === '/api/me') {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '');
+        if (!token) return json({ authenticated: false }, 401);
+        const user = await spotify('/me', token);
+        logAuth('spotify_user_loaded', { id: user.id, email: user.email, product: user.product });
+        return json({ authenticated: true, user });
+      }
+      if (url.pathname === '/api/token' && req.method === 'POST') {
+        if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !SPOTIFY_REDIRECT_URI) return json({ error: 'Missing Spotify env vars' }, 500);
+        const { code } = await req.json();
+        const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: SPOTIFY_REDIRECT_URI });
+        const basic = btoa(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`);
+        const res = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { authorization: `Basic ${basic}`, 'content-type': 'application/x-www-form-urlencoded' }, body });
+        return json(await res.json(), res.status);
+      }
+      if (url.pathname === '/api/artists') {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '');
+        if (!token) return json({ error: 'Missing bearer token' }, 401);
+        const [followed, liked] = await Promise.all([getFollowedArtists(token), getLikedSongArtists(token)]);
+        const deduped = new Map();
+        for (const artist of [...followed, ...liked]) deduped.set(artist.id || artist.name, { id: artist.id, name: artist.name, image: artist.images?.[0]?.url });
+        return json({ artists: [...deduped.values()].filter(a => a.id).sort((a, b) => a.name.localeCompare(b.name)) });
+      }
+      if (url.pathname === '/api/spotify-concerts' && req.method === 'POST') {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '');
+        if (!token) return json({ error: 'Missing bearer token' }, 401);
+        const { artistIds = [] } = await req.json();
+        return json(await getSpotifyConcerts(token, artistIds));
+      }
+      return serveStatic(url.pathname);
+    } catch (error) {
+      logAuth('server_error', { path: url.pathname, message: error instanceof Error ? error.message : 'Server error' });
+      return json({ error: error instanceof Error ? error.message : 'Server error' }, 500);
+    }
+  }
+});
+console.log(`App listening on http://localhost:${PORT}`);
