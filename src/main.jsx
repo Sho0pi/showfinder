@@ -88,7 +88,8 @@ function ConcertMap({ events }) {
         if (cancelled) return;
         if (!coords) continue;
         const when = `${event.dayLabel ? event.dayLabel + ' ' : ''}${event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA'}`;
-        const lineup = (event.lineup || [event.artist]).join(', ');
+        const lineupArr = (event.lineup || [event.artist]).filter(Boolean);
+        const lineup = lineupArr.slice(0, 6).join(', ') + (lineupArr.length > 6 ? ` +${lineupArr.length - 6} more` : '');
         const where = [event.venue, event.city, event.country].filter(Boolean).join(', ') || 'Location TBA';
         const vendor = event.ticketVendor ? `<br><em style="color:#8B8389">${event.onSale ? 'On sale' : 'Tickets'} · ${event.ticketVendor}</em>` : '';
         const img = event.image ? `<img src="${event.image}" alt="" style="width:100%;height:96px;object-fit:cover;border-radius:8px;margin-bottom:8px">` : '';
@@ -250,9 +251,14 @@ function RegionBar({ regionSet, setRegionSet }) {
   );
 }
 
-function ShowCard({ e, i }) {
+function ShowCard({ e, i, artistName }) {
   const date = `${e.dayLabel ? e.dayLabel.toUpperCase() + ' · ' : ''}${e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}`;
   const where = [e.venue, e.city, e.country].filter(Boolean).join(', ') || 'Location TBA';
+  const lineup = (e.lineup || []).filter(Boolean);
+  // A festival / multi-artist bill — show the lineup with the user's artist on top.
+  const isMulti = lineup.length > 1;
+  const others = artistName ? lineup.filter(n => n !== artistName) : lineup;
+  const ordered = artistName ? [artistName, ...others] : lineup;
   return (
     <motion.a
       href={e.ticketUrl || e.url} target="_blank" rel="noreferrer"
@@ -261,13 +267,29 @@ function ShowCard({ e, i }) {
       whileHover={{ y: -3 }}
       className="group block overflow-hidden rounded-md border border-line bg-surface transition-colors hover:border-ember/50"
     >
-      {e.image
-        ? <img src={e.image} alt={e.artist} loading="lazy" decoding="async" width="320" height="150" className="h-[150px] w-full object-cover" />
-        : <div className="h-[150px] w-full bg-gradient-to-br from-surface2 to-[#171a22]" />}
+      <div className="relative">
+        {e.image
+          ? <img src={e.image} alt={e.artist} loading="lazy" decoding="async" width="320" height="150" className="h-[150px] w-full object-cover" />
+          : <div className="h-[150px] w-full bg-gradient-to-br from-surface2 to-[#171a22]" />}
+        {/* Always show which of YOUR artists this show is for. */}
+        {artistName && (
+          <span className="absolute bottom-2 left-2 inline-flex max-w-[88%] items-center gap-1.5 truncate rounded-full bg-canvas/85 px-2.5 py-1 font-mono text-[11px] font-semibold text-ember backdrop-blur">
+            <Music2 size={12} /> {artistName}
+          </span>
+        )}
+      </div>
       <div className="p-[18px]">
         <div className="font-mono text-xs tracking-wide text-ember">{date}</div>
         <h3 className="mt-1.5 font-display text-xl font-bold tracking-tight">{e.name}</h3>
         <div className="mt-1 font-mono text-xs text-muted">{where}</div>
+        {isMulti && (
+          <div className="mt-3">
+            <div className="font-mono text-[10px] uppercase tracking-wider text-muted">Lineup · {lineup.length}</div>
+            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted">
+              {ordered.map((n, idx) => <span key={n + idx} className={n === artistName ? 'font-semibold text-ink' : ''}>{n}{idx < ordered.length - 1 ? ' · ' : ''}</span>)}
+            </p>
+          </div>
+        )}
         {e.genres?.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-1.5">
             {e.genres.slice(0, 4).map(g => <span key={g} className="rounded-full border border-teal/30 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-teal">{g}</span>)}
@@ -382,6 +404,8 @@ function App() {
   useEffect(() => {
     if (auth.authenticated && token && !artists.length && !loading) loadEverything();
   }, [auth.authenticated, token]);
+
+  const nameById = useMemo(() => new Map(artists.map(a => [a.id, a.name])), [artists]);
 
   // Upcoming-show count per artist (from the prefetched list) for the rail badges.
   const countByArtist = useMemo(() => {
@@ -552,7 +576,7 @@ function App() {
             <ConcertMap events={shownEvents} />
           </section>
           {shownEvents.length > 0
-            ? <section className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} />)}</section>
+            ? <section className="mt-6 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{shownEvents.map((e, i) => <ShowCard key={e.id} e={e} i={i} artistName={nameById.get(e.artistId)} />)}</section>
             : <p className="mt-6 font-mono text-sm text-muted">No shows match your filters.</p>}
         </>
       )}
