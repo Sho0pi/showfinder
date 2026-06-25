@@ -153,25 +153,27 @@ function LoginScreen({ auth }) {
   );
 }
 
-function ArtistRail({ artists, selected, toggle }) {
+function ArtistRail({ artists, selected, toggle, counts }) {
   if (!artists.length) return null;
   return (
-    <div className="flex max-h-[300px] flex-wrap gap-x-4 gap-y-5 overflow-y-auto pr-1">
-      {artists.map((a, i) => {
+    <div className="flex max-h-[320px] flex-wrap content-start gap-x-4 gap-y-5 overflow-y-auto pr-1">
+      {artists.map((a) => {
         const on = selected.includes(a.id);
+        const count = counts[a.id] || 0;
         return (
           <button
             key={a.id || a.name}
             onClick={() => toggle(a.id)}
             aria-pressed={on}
-            className={`w-[78px] flex-none text-center transition ${on ? '' : 'opacity-50 hover:opacity-100'}`}
+            title={a.name}
+            className={`flex w-[84px] flex-none flex-col items-center text-center transition ${on ? '' : 'opacity-50 hover:opacity-100'}`}
           >
-            <div className={`relative mx-auto grid h-[78px] w-[78px] place-items-center overflow-hidden rounded-full bg-surface2 font-display text-2xl font-extrabold text-muted ${on ? 'shadow-[0_0_0_3px_var(--color-ember)]' : 'shadow-[0_0_0_1px_var(--color-line)]'}`}>
+            <div className={`relative grid h-[78px] w-[78px] place-items-center overflow-hidden rounded-full bg-surface2 font-display text-2xl font-extrabold text-muted ${on ? 'shadow-[0_0_0_3px_var(--color-ember)]' : 'shadow-[0_0_0_1px_var(--color-line)]'}`}>
               {a.image ? <img src={a.image} alt={a.name} loading="lazy" className="h-full w-full object-cover" /> : (a.name?.[0] || '?')}
+              {count > 0 && !on && <span className="absolute -right-1 -top-1 grid h-5 min-w-5 place-items-center rounded-full border-2 border-surface bg-ember px-1 font-mono text-[10px] font-bold text-canvas">{count}</span>}
               {on && <span className="absolute -bottom-0.5 -right-0.5 grid h-6 w-6 place-items-center rounded-full border-2 border-surface bg-ember text-canvas"><Check size={13} strokeWidth={3} /></span>}
             </div>
-            <div className={`mt-1.5 font-mono text-[10px] ${on ? 'text-ember' : 'text-muted'}`}>#{i + 1}</div>
-            <div className={`truncate text-xs ${on ? 'font-semibold text-ink' : 'text-muted'}`}>{a.name}</div>
+            <div className={`mt-1.5 text-xs leading-tight break-words ${on ? 'font-semibold text-ink' : 'text-muted'}`}>{a.name}</div>
           </button>
         );
       })}
@@ -265,30 +267,26 @@ function App() {
       .catch(e => setError(e.message)).finally(() => setLoading(''));
   }, [token]);
 
-  async function loadArtists() {
-    setLoading('Loading your Spotify artists'); setError('');
-    try { const data = await fetch(`${API}/artists`, { headers: { authorization: `Bearer ${token}` } }).then(readJson); setArtists(data.artists || []); }
-    catch (e) { setError(e.message); } finally { setLoading(''); }
-  }
-
-  async function findConcerts() {
-    setLoading('Loading your shows'); setError('');
+  // Load artists, then immediately prefetch the show list for ALL of them so each
+  // artist can display a count badge and clicking one shows their shows instantly.
+  async function loadEverything() {
+    setError(''); setLoading('Loading your artists');
     try {
-      const data = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: selected }) }).then(readJson);
-      const list = data.events || [];
-      setEvents(list);
-      setLoading('');
-      if (list.length) {
-        fetch(`${API}/concert-detail`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ concerts: list.map(e => ({ id: e.id, url: e.url })) }) })
-          .then(readJson)
-          .then(({ details }) => setEvents(cur => cur.map(e => details?.[e.id] ? { ...e, ...details[e.id], image: e.image || details[e.id].image } : e)))
-          .catch(() => {});
-      }
-    } catch (e) { setError(e.message); setLoading(''); }
+      const data = await fetch(`${API}/artists`, { headers: { authorization: `Bearer ${token}` } }).then(readJson);
+      const list = data.artists || [];
+      setArtists(list);
+      const ids = list.map(a => a.id).filter(Boolean);
+      if (!ids.length) { setLoading(''); return; }
+      setLoading(`Finding shows for ${ids.length} artists`);
+      const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: ids }) }).then(readJson);
+      enrichedRef.current = new Set();
+      setEvents(res.events || []);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(''); }
   }
 
   useEffect(() => {
-    if (auth.authenticated && token && !artists.length && !loading) loadArtists();
+    if (auth.authenticated && token && !artists.length && !loading) loadEverything();
   }, [auth.authenticated, token]);
 
   const visibleArtists = useMemo(() => {
@@ -311,6 +309,33 @@ function App() {
     if (filters.endDate && (!day || day > filters.endDate)) return false;
     return true;
   }), [events, selected, filters.startDate, filters.endDate]);
+
+  // Upcoming-show count per artist (from the prefetched list) for the rail badges.
+  const countByArtist = useMemo(() => {
+    const m = {};
+    for (const e of events) if (e.artistId) m[e.artistId] = (m[e.artistId] || 0) + 1;
+    return m;
+  }, [events]);
+
+  // Lazily enrich (venue/genres/vendor/coords) only the shows currently shown.
+  const enrichedRef = React.useRef(new Set());
+  useEffect(() => {
+    const todo = shownEvents.filter(e => e.id && e.url && !enrichedRef.current.has(e.id));
+    if (!todo.length) return;
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < todo.length; i += 100) {
+        const chunk = todo.slice(i, i + 100);
+        chunk.forEach(e => enrichedRef.current.add(e.id));
+        try {
+          const { details } = await fetch(`${API}/concert-detail`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ concerts: chunk.map(e => ({ id: e.id, url: e.url })) }) }).then(readJson);
+          if (cancelled || !details) continue;
+          setEvents(cur => cur.map(e => details[e.id] ? { ...e, ...details[e.id], image: e.image || details[e.id].image } : e));
+        } catch {}
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [shownEvents]);
 
   function toggleArtist(id) { setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]); }
   function selectVisibleArtists() {
@@ -354,12 +379,9 @@ function App() {
       <section className="mt-7 grid items-start gap-6 lg:grid-cols-[320px_1fr]">
         <aside className="rounded-lg border border-line bg-surface/70 p-5 backdrop-blur">
           <h2 className="font-display text-lg font-bold">Actions</h2>
-          <p className="mt-1 text-sm text-muted">Pick your artists, then pull their upcoming shows.</p>
+          <p className="mt-1 text-sm text-muted">Click an artist to drop their shows on the map.</p>
           <div className="mt-4 grid gap-2">
-            <button onClick={loadArtists} className={ghostCls}><RefreshCw size={15} /> Refresh artists</button>
-            <button onClick={findConcerts} disabled={!selected.length} className="inline-flex items-center justify-center gap-2 rounded-full bg-ember px-4 py-2.5 font-semibold text-canvas transition hover:-translate-y-0.5 disabled:translate-y-0 disabled:opacity-40">
-              <MapPin size={16} /> Find concerts
-            </button>
+            <button onClick={loadEverything} className={ghostCls}><RefreshCw size={15} /> Refresh</button>
           </div>
           <div className="mt-4">
             <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted">Select top</div>
@@ -390,7 +412,7 @@ function App() {
               <button onClick={deselectVisibleArtists} disabled={!visibleArtists.length} className={`${ghostCls} whitespace-nowrap`}>Clear shown</button>
             </div>
           </div>
-          <ArtistRail artists={visibleArtists} selected={selected} toggle={toggleArtist} />
+          <ArtistRail artists={visibleArtists} selected={selected} toggle={toggleArtist} counts={countByArtist} />
         </section>
       </section>
 

@@ -462,7 +462,7 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise
 }
 
 async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
-  const ids = artistIds.slice(0, 100);
+  const ids = artistIds.slice(0, 400);
   let events: any[] = [];
   let source = 'spotify-pathfinder';
   try {
