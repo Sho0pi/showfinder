@@ -404,19 +404,26 @@ function App() {
       });
   }, [artists, selected, artistSearch, hideEmpty, countByArtist]);
 
-  const shownEvents = useMemo(() => events.filter(e => {
+  // Selected artists' shows after the date filter — drives enrichment so that
+  // country populates BEFORE the region filter narrows (otherwise un-enriched
+  // shows get filtered out, never enriched, and the region filter shows nothing).
+  const selectedEvents = useMemo(() => events.filter(e => {
     if (e.artistId && !selected.includes(e.artistId)) return false;
     const day = String(e.date || '').slice(0, 10);
     if (filters.startDate && (!day || day < filters.startDate)) return false;
     if (filters.endDate && (!day || day > filters.endDate)) return false;
-    if (regionSet.size && !regionSet.has(e.country)) return false;
     return true;
-  }), [events, selected, filters.startDate, filters.endDate, regionSet]);
+  }), [events, selected, filters.startDate, filters.endDate]);
+
+  // What's actually shown = selected shows narrowed by the region filter.
+  const shownEvents = useMemo(() =>
+    regionSet.size ? selectedEvents.filter(e => regionSet.has(e.country)) : selectedEvents,
+    [selectedEvents, regionSet]);
 
   // Lazily enrich (venue/genres/vendor/coords) only the shows currently shown.
   const enrichedRef = React.useRef(new Set());
   useEffect(() => {
-    const todo = shownEvents.filter(e => e.id && e.url && !enrichedRef.current.has(e.id));
+    const todo = selectedEvents.filter(e => e.id && e.url && !enrichedRef.current.has(e.id));
     if (!todo.length) return;
     let cancelled = false;
     (async () => {
@@ -431,7 +438,7 @@ function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [shownEvents]);
+  }, [selectedEvents]);
 
   function toggleArtist(id) { setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]); }
   function selectVisibleArtists() {
