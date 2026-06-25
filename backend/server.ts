@@ -199,7 +199,7 @@ async function pathfinderConcerts(artistId: string, artistName: string, retry = 
 const CURL_UA = 'curl/8.4.0';
 
 function parseConcertDetailHtml(html: string, concertId: string) {
-  const empty = { venue: null, country: null, lat: null, lon: null, dayLabel: null, genres: [] as string[], ticketVendor: null, ticketUrl: null, onSale: false };
+  const empty = { venue: null, country: null, lat: null, lon: null, dayLabel: null, genres: [] as string[], ticketVendor: null, ticketUrl: null, onSale: false, image: null as string | null };
   const blobs = html.match(/[A-Za-z0-9+/]{800,}={0,2}/g) || [];
   for (const b64 of blobs) {
     let json: any;
@@ -211,6 +211,8 @@ function parseConcertDetailHtml(html: string, concertId: string) {
     const c = items[key];
     const offer = c.offers?.items?.[0] || {};
     const dayLabel = c.startDateIsoString ? new Date(c.startDateIsoString).toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }) : null;
+    const sources = c.artists?.items?.[0]?.data?.visuals?.avatarImage?.sources || [];
+    const image = sources[sources.length - 1]?.url || sources[0]?.url || null;
     return {
       venue: c.location?.name || null,
       country: c.location?.country || null,
@@ -220,7 +222,8 @@ function parseConcertDetailHtml(html: string, concertId: string) {
       genres: (c.concepts?.items || []).map((g: any) => g.data?.name).filter(Boolean),
       ticketVendor: offer.providerName || null,
       ticketUrl: offer.url || null,
-      onSale: String(offer.saleType || '').includes('on-sale')
+      onSale: String(offer.saleType || '').includes('on-sale'),
+      image
     };
   }
   return empty;
@@ -541,7 +544,7 @@ Bun.serve({
         const events = (concerts as any[]).filter(c => c?.id && c?.url).slice(0, 100);
         await enrichConcertsHttp(events);
         const byId: Record<string, any> = {};
-        for (const e of events) byId[e.id] = { venue: e.venue, country: e.country, lat: e.lat, lon: e.lon, dayLabel: e.dayLabel, genres: e.genres, ticketVendor: e.ticketVendor, ticketUrl: e.ticketUrl, onSale: e.onSale };
+        for (const e of events) byId[e.id] = { venue: e.venue, country: e.country, lat: e.lat, lon: e.lon, dayLabel: e.dayLabel, genres: e.genres, ticketVendor: e.ticketVendor, ticketUrl: e.ticketUrl, onSale: e.onSale, image: e.image };
         return json({ details: byId });
       }
       return serveStatic(url.pathname);

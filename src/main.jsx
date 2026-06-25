@@ -207,7 +207,7 @@ function App() {
       if (list.length) {
         fetch(`${API}/concert-detail`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ concerts: list.map(e => ({ id: e.id, url: e.url })) }) })
           .then(readJson)
-          .then(({ details }) => setEvents(cur => cur.map(e => details?.[e.id] ? { ...e, ...details[e.id] } : e)))
+          .then(({ details }) => setEvents(cur => cur.map(e => details?.[e.id] ? { ...e, ...details[e.id], image: e.image || details[e.id].image } : e)))
           .catch(() => {});
       }
     } catch (e) { setError(e.message); setLoading(''); }
