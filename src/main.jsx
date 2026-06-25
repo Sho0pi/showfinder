@@ -67,11 +67,14 @@ function ConcertMap({ events }) {
     async function plot() {
       const map = mapRef.current, layer = layerRef.current;
       if (!map || !layer) return;
+      // Recalc size — the container may have reflowed (filter change, view toggle),
+      // which otherwise leaves Leaflet with stale dimensions and grey/misplaced tiles.
+      map.invalidateSize();
       layer.clearLayers();
       const cache = loadGeocodeCache();
       const bounds = [];
       let placed = 0;
-      const cities = [...new Set(events.map(e => String(e.city || '').trim()).filter(Boolean))];
+      const cities = [...new Set(events.filter(e => e.lat == null || e.lon == null).map(e => String(e.city || '').trim()).filter(Boolean))];
       const uncached = cities.filter(c => !(c.toLowerCase() in cache));
       if (uncached.length) setStatus(`Placing ${uncached.length} new ${uncached.length === 1 ? 'city' : 'cities'} on the map`);
       for (const event of events) {
@@ -94,7 +97,7 @@ function ConcertMap({ events }) {
         if (wasUncached) await new Promise(r => setTimeout(r, 1100));
       }
       if (cancelled) return;
-      if (bounds.length) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 6 });
+      if (bounds.length) { map.invalidateSize(); map.fitBounds(bounds, { padding: [40, 40], maxZoom: 6 }); }
       setStatus(placed ? '' : 'No shows could be placed on the map yet.');
     }
     plot();
