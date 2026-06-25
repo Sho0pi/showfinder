@@ -219,13 +219,16 @@ function App() {
 
   const visibleArtists = useMemo(() => {
     const query = artistSearch.trim().toLowerCase();
+    // artists arrive ranked by listening affinity from the server; keep that order
+    // within the selected/unselected groups (selected stay on top).
+    const rank = new Map(artists.map((a, i) => [a.id, i]));
     return artists
       .filter(artist => !query || String(artist.name || '').toLowerCase().includes(query))
       .sort((a, b) => {
         const aSelected = selected.includes(a.id) ? 0 : 1;
         const bSelected = selected.includes(b.id) ? 0 : 1;
         if (aSelected !== bSelected) return aSelected - bSelected;
-        return String(a.name || '').localeCompare(String(b.name || ''));
+        return (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0);
       });
   }, [artists, selected, artistSearch]);
 

@@ -89,18 +89,41 @@ async function getFollowedArtists(accessToken: string) {
   return artists;
 }
 
+// Returns id -> { artist, count }, where count is how many liked tracks feature
+// that artist (a rough affinity signal).
 async function getLikedSongArtists(accessToken: string) {
-  const map = new Map();
+  const map = new Map<string, { artist: any; count: number }>();
   let offset = 0;
   while (offset < 500) {
     const data = await spotify(`/me/tracks?limit=50&offset=${offset}`, accessToken);
     for (const item of data.items || []) {
-      for (const artist of item.track?.artists || []) map.set(artist.id || artist.name, artist);
+      for (const artist of item.track?.artists || []) {
+        const key = artist.id || artist.name;
+        const entry = map.get(key) || { artist, count: 0 };
+        entry.count++;
+        map.set(key, entry);
+      }
     }
     if (!data.next) break;
     offset += 50;
   }
-  return [...map.values()];
+  return map;
+}
+
+// Returns id -> rank (lower = listened to more). Recent listening (medium_term)
+// ranks above all-time (long_term). Empty if the user-top-read scope is missing.
+async function getTopArtists(accessToken: string) {
+  const rank = new Map<string, number>();
+  const ranges = ['medium_term', 'long_term'];
+  for (let r = 0; r < ranges.length; r++) {
+    try {
+      const data = await spotify(`/me/top/artists?limit=50&time_range=${ranges[r]}`, accessToken);
+      (data.items || []).forEach((a: any, i: number) => { if (a.id && !rank.has(a.id)) rank.set(a.id, r * 100 + i); });
+    } catch (error) {
+      logAuth('top_artists_error', { range: ranges[r], message: error instanceof Error ? error.message : 'top fetch failed' });
+    }
+  }
+  return rank;
 }
 
 function stripHtml(value: string) {
@@ -490,7 +513,7 @@ Bun.serve({
           client_id: SPOTIFY_CLIENT_ID,
           response_type: 'code',
           redirect_uri: SPOTIFY_REDIRECT_URI,
-          scope: 'user-follow-read user-library-read',
+          scope: 'user-follow-read user-library-read user-top-read',
           show_dialog: 'true'
         });
         return Response.redirect(`https://accounts.spotify.com/authorize?${params}`, 302);
@@ -537,10 +560,24 @@ Bun.serve({
       if (url.pathname === '/api/artists') {
         const token = req.headers.get('authorization')?.replace('Bearer ', '');
         if (!token) return json({ error: 'Missing bearer token' }, 401);
-        const [followed, liked] = await Promise.all([getFollowedArtists(token), getLikedSongArtists(token)]);
+        const [followed, likedMap, topRank] = await Promise.all([getFollowedArtists(token), getLikedSongArtists(token), getTopArtists(token)]);
         const deduped = new Map();
-        for (const artist of [...followed, ...liked]) deduped.set(artist.id || artist.name, { id: artist.id, name: artist.name, image: artist.images?.[0]?.url });
-        return json({ artists: [...deduped.values()].filter(a => a.id).sort((a, b) => a.name.localeCompare(b.name)) });
+        for (const artist of followed) deduped.set(artist.id || artist.name, { id: artist.id, name: artist.name, image: artist.images?.[0]?.url });
+        for (const { artist } of likedMap.values()) {
+          const key = artist.id || artist.name;
+          if (!deduped.has(key)) deduped.set(key, { id: artist.id, name: artist.name, image: artist.images?.[0]?.url });
+        }
+        // Order by listening affinity: top-artists rank, then liked-track count, then name.
+        const likedCount = (id: string) => likedMap.get(id)?.count || 0;
+        const artists = [...deduped.values()].filter(a => a.id).sort((a, b) => {
+          const ra = topRank.has(a.id) ? topRank.get(a.id)! : Infinity;
+          const rb = topRank.has(b.id) ? topRank.get(b.id)! : Infinity;
+          if (ra !== rb) return ra - rb;
+          const la = likedCount(a.id), lb = likedCount(b.id);
+          if (la !== lb) return lb - la;
+          return a.name.localeCompare(b.name);
+        });
+        return json({ artists });
       }
       if (url.pathname === '/api/spotify-concerts' && req.method === 'POST') {
         const token = req.headers.get('authorization')?.replace('Bearer ', '');
