@@ -284,28 +284,26 @@ function App() {
       enrichedRef.current = new Set();
       setEvents([]);
       const imgById = new Map(list.map(a => [a.id, a.image]));
-      // Stream the show lists in small chunks with a client-side pool so the
-      // count badges fill in progressively instead of waiting for everyone.
-      const CHUNK = 6, POOL = 3;
-      const chunks = [];
-      for (let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK));
+      // Stream one artist at a time through a wide client pool — each artist's
+      // badge appears the instant its own request resolves.
+      const POOL = 10;
       let next = 0, done = 0;
       setLoading(`Finding shows (0/${ids.length})`);
       async function worker() {
-        while (next < chunks.length) {
-          const chunk = chunks[next++];
+        while (next < ids.length) {
+          const id = ids[next++];
           try {
-            const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: chunk }), signal: AbortSignal.timeout(40000) }).then(readJson);
+            const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: [id] }), signal: AbortSignal.timeout(30000) }).then(readJson);
             if (res.events?.length) {
               const withImg = res.events.map(e => ({ ...e, image: e.image || imgById.get(e.artistId) || null }));
               setEvents(cur => [...cur, ...withImg]);
             }
           } catch {}
-          done += chunk.length;
+          done++;
           setLoading(done < ids.length ? `Finding shows (${done}/${ids.length})` : '');
         }
       }
-      await Promise.all(Array.from({ length: Math.min(POOL, chunks.length) }, () => worker()));
+      await Promise.all(Array.from({ length: Math.min(POOL, ids.length) }, () => worker()));
     } catch (e) { setError(e.message); }
     finally { setLoading(''); }
   }
