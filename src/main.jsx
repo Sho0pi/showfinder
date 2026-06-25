@@ -11,6 +11,98 @@ async function readJson(res) {
   return data;
 }
 
+const GEOCODE_CACHE_KEY = 'geocode_cache_v1';
+
+function loadGeocodeCache() {
+  try { return JSON.parse(localStorage.getItem(GEOCODE_CACHE_KEY) || '{}'); }
+  catch { return {}; }
+}
+
+function saveGeocodeCache(cache) {
+  try { localStorage.setItem(GEOCODE_CACHE_KEY, JSON.stringify(cache)); } catch {}
+}
+
+// City string -> {lat, lon} via Nominatim, cached in localStorage.
+// Returns null for empty/unresolvable cities. Caches misses too (as null) so
+// we never re-hit the network for a city Nominatim can't place.
+async function geocodeCity(city, cache) {
+  const key = String(city || '').trim().toLowerCase();
+  if (!key) return null;
+  if (key in cache) return cache[key];
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(city)}`;
+  try {
+    const res = await fetch(url, { headers: { accept: 'application/json' } });
+    const data = await res.json().catch(() => []);
+    const hit = data[0];
+    cache[key] = hit ? { lat: Number(hit.lat), lon: Number(hit.lon) } : null;
+  } catch {
+    cache[key] = null;
+  }
+  saveGeocodeCache(cache);
+  return cache[key];
+}
+
+function ConcertMap({ events }) {
+  const containerRef = React.useRef(null);
+  const mapRef = React.useRef(null);
+  const layerRef = React.useRef(null);
+  const [status, setStatus] = useState('');
+
+  // Init the Leaflet map once.
+  useEffect(() => {
+    if (!window.L || !containerRef.current || mapRef.current) return;
+    const map = window.L.map(containerRef.current, { worldCopyJump: true }).setView([20, 0], 2);
+    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap', maxZoom: 18
+    }).addTo(map);
+    mapRef.current = map;
+    layerRef.current = window.L.layerGroup().addTo(map);
+    return () => { map.remove(); mapRef.current = null; };
+  }, []);
+
+  // Geocode + plot whenever events change. Nominatim asks for <=1 req/s, so we
+  // queue lookups serially with a small gap; the cache makes repeats free.
+  useEffect(() => {
+    let cancelled = false;
+    async function plot() {
+      const map = mapRef.current, layer = layerRef.current;
+      if (!map || !layer) return;
+      layer.clearLayers();
+      const cache = loadGeocodeCache();
+      const bounds = [];
+      let placed = 0;
+      const cities = [...new Set(events.map(e => String(e.city || '').trim()).filter(Boolean))];
+      const uncached = cities.filter(c => !(c.toLowerCase() in cache));
+      if (uncached.length) setStatus(`Placing ${uncached.length} new ${uncached.length === 1 ? 'city' : 'cities'} on the map`);
+      for (const event of events) {
+        if (cancelled) return;
+        const wasUncached = event.city && !(String(event.city).trim().toLowerCase() in cache);
+        const coords = await geocodeCity(event.city, cache);
+        if (cancelled) return;
+        if (!coords) continue;
+        const when = event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA';
+        const lineup = (event.lineup || [event.artist]).join(', ');
+        const popup = `<strong>${event.name || event.artist}</strong><br>${when}<br>${event.city || 'Location TBA'}<br>${lineup}<br><a href="${event.url}" target="_blank" rel="noreferrer">Tickets</a>`;
+        window.L.marker([coords.lat, coords.lon]).bindPopup(popup).addTo(layer);
+        bounds.push([coords.lat, coords.lon]);
+        placed++;
+        if (wasUncached) await new Promise(r => setTimeout(r, 1100));
+      }
+      if (cancelled) return;
+      if (bounds.length) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 6 });
+      setStatus(placed ? '' : 'No shows could be placed on the map yet.');
+    }
+    plot();
+    return () => { cancelled = true; };
+  }, [events]);
+
+  return <div className="mapWrap">
+    {!window.L && <div className="notice error">Map library failed to load. Check your connection and reload.</div>}
+    {status && <div className="notice">{status}...</div>}
+    <div className="map" ref={containerRef} />
+  </div>;
+}
+
 function LoginScreen({ auth }) {
   return <main className="loginPage">
     <section className="simpleLogin">
@@ -50,6 +142,7 @@ function App() {
   const [error, setError] = useState('');
   const [filters, setFilters] = useState({ continent: '', country: '', city: '', radius: '', startDate: '', endDate: '' });
   const [artistSearch, setArtistSearch] = useState('');
+  const [view, setView] = useState('list');
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -135,7 +228,10 @@ function App() {
     <section className="hero"><div><p className="eyebrow">Connected as {auth.user?.display_name || auth.user?.id}</p><h1>Your Spotify radar</h1><p>Your artists load automatically. Pick the ones you care about, then pull their latest Spotify releases.</p></div><button className="ghost" onClick={() => { localStorage.removeItem('spotify_access_token'); setToken(''); }}>Sign out</button></section>
     {error && <div className="notice error">{error}</div>}{loading && <div className="notice">{loading}...</div>}
     <section className="grid"><aside className="card"><h2>Actions</h2><p>This scrapes Spotify's own concert data and formats the results here.</p><button onClick={loadArtists}>Refresh artists</button><button onClick={findConcerts} disabled={!selected.length}>Find Spotify concerts</button></aside><section className="card"><div className="artistHeader"><div><h2>Artists</h2><p>{selected.length} selected. Selected artists stay on top.</p></div><div className="artistTools"><input value={artistSearch} onChange={e => setArtistSearch(e.target.value)} placeholder="Search artists" aria-label="Search artists" /><button className="ghost" onClick={selectVisibleArtists} disabled={!visibleArtists.length}>Select shown</button><button className="ghost" onClick={deselectVisibleArtists} disabled={!visibleArtists.length}>Deselect shown</button></div></div><div className="chips">{visibleArtists.map(a => <button key={a.id || a.name} className={`chip ${selected.includes(a.id) ? 'on' : ''}`} onClick={() => setSelected(s => s.includes(a.id) ? s.filter(x => x !== a.id) : [...s, a.id])}>{a.name}</button>)}</div></section></section>
-    <section className="results eventGrid">{events.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}><span>{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span><h3>{e.name}</h3><p>{e.city || 'Location TBA'}</p><p>{(e.lineup || [e.artist]).join(', ')}</p></a>)}</section>
+    {events.length > 0 && <div className="viewToggle"><button className={`ghost ${view === 'list' ? 'on' : ''}`} onClick={() => setView('list')}>List</button><button className={`ghost ${view === 'map' ? 'on' : ''}`} onClick={() => setView('map')}>Map</button></div>}
+    {view === 'map'
+      ? <section className="results"><ConcertMap events={events} /></section>
+      : <section className="results eventGrid">{events.map(e => <a className="event" href={e.url} target="_blank" rel="noreferrer" key={e.id}><span>{e.date ? new Date(e.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Date TBA'}</span><h3>{e.name}</h3><p>{e.city || 'Location TBA'}</p><p>{(e.lineup || [e.artist]).join(', ')}</p></a>)}</section>}
   </main>;
 }
 

@@ -2,7 +2,6 @@ const PORT = Number(Bun.env.PORT || Bun.env.API_PORT || 45678);
 const SPOTIFY_CLIENT_ID = Bun.env.SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_CLIENT_SECRET = Bun.env.SPOTIFY_CLIENT_SECRET || '';
 const SPOTIFY_REDIRECT_URI = Bun.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:45678/callback';
-const SPOTIFY_SP_DC = Bun.env.SPOTIFY_SP_DC || '';
 const DIST_DIR = new URL('../dist/', import.meta.url);
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
@@ -108,88 +107,6 @@ function stripHtml(value: string) {
   return value.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const WEB_TOKEN_SECRET_BYTES = [12, 56, 76, 33, 88, 44, 88, 33, 78, 78, 11, 66, 22, 22, 55, 69, 54];
-const WEB_TOKEN_VERSION = 5;
-let cachedWebToken: { token: string; expiresAt: number } | null = null;
-
-function base32(bytes: Uint8Array) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let bits = 0, value = 0, output = '';
-  for (const byte of bytes) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      output += alphabet[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
-  }
-  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
-  return output;
-}
-
-async function hmacSha1(key: Uint8Array, message: Uint8Array) {
-  const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-  return new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, message));
-}
-
-function base32Decode(input: string) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let bits = 0, value = 0;
-  const output = [];
-  for (const char of input.replace(/=+$/, '')) {
-    const index = alphabet.indexOf(char.toUpperCase());
-    if (index < 0) continue;
-    value = (value << 5) | index;
-    bits += 5;
-    if (bits >= 8) {
-      output.push((value >>> (bits - 8)) & 255);
-      bits -= 8;
-    }
-  }
-  return new Uint8Array(output);
-}
-
-async function makeTotp(serverSeconds: number) {
-  const transformed = WEB_TOKEN_SECRET_BYTES.map((value, index) => value ^ ((index % 33) + 9));
-  const hexString = Array.from(new TextEncoder().encode(transformed.join(''))).map(b => b.toString(16).padStart(2, '0')).join('');
-  const bytes = new Uint8Array(hexString.match(/.{2}/g)!.map(x => parseInt(x, 16)));
-  const key = base32Decode(base32(bytes));
-  const counter = Math.floor(serverSeconds / 30);
-  const msg = new Uint8Array(8);
-  new DataView(msg.buffer).setUint32(4, counter);
-  const hmac = await hmacSha1(key, msg);
-  const offset = hmac[hmac.length - 1] & 15;
-  const code = ((hmac[offset] & 127) << 24) | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3];
-  return String(code % 1000000).padStart(6, '0');
-}
-
-async function getSpotifyWebToken(forceRefresh = false) {
-  if (!forceRefresh && cachedWebToken && cachedWebToken.expiresAt > Date.now() + 60000) return cachedWebToken.token;
-  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-  const timeRes = await fetch('https://open.spotify.com/api/server-time', { headers: { 'user-agent': ua, accept: 'application/json' } });
-  const timeData = await timeRes.json().catch(() => ({}));
-  const serverSeconds = Number(timeData.serverTime || Math.floor(Date.now() / 1000));
-  const totp = await makeTotp(serverSeconds);
-  const params = new URLSearchParams({
-    reason: 'transport',
-    productType: 'web-player',
-    totp,
-    totpServer: totp,
-    totpVer: String(WEB_TOKEN_VERSION),
-    sTime: String(serverSeconds),
-    cTime: String(serverSeconds)
-  });
-  const headers: Record<string, string> = { 'user-agent': ua, accept: 'application/json', referer: 'https://open.spotify.com/', 'app-platform': 'WebPlayer' };
-  if (SPOTIFY_SP_DC) headers.cookie = `sp_dc=${SPOTIFY_SP_DC}`;
-  const res = await fetch(`https://open.spotify.com/get_access_token?${params}`, { headers });
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`Spotify web token failed ${res.status}: ${raw.slice(0, 120)}`);
-  const data = JSON.parse(raw);
-  if (!data.accessToken) throw new Error(`Spotify web token response missing accessToken: ${raw.slice(0, 120)}`);
-  cachedWebToken = { token: data.accessToken, expiresAt: Number(data.accessTokenExpirationTimestampMs || Date.now() + 600000) };
-  return cachedWebToken.token;
-}
-
 async function scrapeSpotifyConcertPage(artist: any) {
   const { chromium } = await import('playwright');
   const browser = await chromium.launch({ headless: true });
@@ -228,43 +145,12 @@ async function scrapeSpotifyConcertPage(artist: any) {
 
 async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
   const events = [];
-  let webToken = '';
-  try { webToken = await getSpotifyWebToken(); }
-  catch (error) { logAuth('spotify_web_token_unavailable', { message: error instanceof Error ? error.message : 'Token failed' }); }
   for (const artistId of artistIds.slice(0, 25)) {
     const artist = await spotify(`/artists/${artistId}`, accessToken);
-    const concertsUrl = `https://open.spotify.com/artist/${artistId}/concerts`;
     try {
-      if (!webToken) throw new Error('Spotify web token unavailable');
-      const queryBody = JSON.stringify({ variables: { artistUri: `spotify:artist:${artistId}`, geoHash: null, includeNearby: false }, operationName: 'ArtistConcerts', extensions: { persistedQuery: { version: 1, sha256Hash: 'ef53c43b865496b9890b7167eab1dc614a8949ef9451b3c41184ea888de8bd2b' } } });
-      let res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', {
-        method: 'POST',
-        headers: { authorization: `Bearer ${webToken}`, accept: 'application/json', 'content-type': 'application/json;charset=UTF-8', 'app-platform': 'WebPlayer' },
-        body: queryBody
-      });
-      if (res.status === 401 || res.status === 403) {
-        webToken = await getSpotifyWebToken(true);
-        res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', {
-          method: 'POST',
-          headers: { authorization: `Bearer ${webToken}`, accept: 'application/json', 'content-type': 'application/json;charset=UTF-8', 'app-platform': 'WebPlayer' },
-          body: queryBody
-        });
-      }
-      const raw = await res.text();
-      const data = JSON.parse(raw || '{}');
-      if (!res.ok) throw new Error(data?.errors?.[0]?.message || `Spotify partner API ${res.status}`);
-      for (const item of data?.data?.concerts?.concerts?.items || []) {
-        const concert = item.data;
-        const concertId = concert.uri?.split(':').pop() || `${artistId}-${concert.startDateIsoString}`;
-        events.push({ id: concertId, artist: artist.name, name: concert.title || artist.name, date: concert.startDateIsoString, city: concert.location?.city || '', lineup: (concert.artists?.items || []).map((a: any) => a.data?.profile?.name).filter(Boolean), type: 'Spotify concert', url: `https://open.spotify.com/concert/${concertId}`, artistUrl: concertsUrl, source: 'spotify-web-token' });
-      }
+      events.push(...await scrapeSpotifyConcertPage(artist));
     } catch (error) {
-      logAuth('spotify_concert_scrape_error', { artistId, message: error instanceof Error ? error.message : 'Fetch failed' });
-      try {
-        events.push(...await scrapeSpotifyConcertPage(artist));
-      } catch (fallbackError) {
-        logAuth('concert_fallback_error', { artistId, message: fallbackError instanceof Error ? fallbackError.message : 'Fallback failed' });
-      }
+      logAuth('concert_scrape_error', { artistId, message: error instanceof Error ? error.message : 'Scrape failed' });
     }
   }
   events.sort((a: any, b: any) => String(a.date || '').localeCompare(String(b.date || '')));
