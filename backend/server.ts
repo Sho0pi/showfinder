@@ -70,10 +70,16 @@ const mockEvents = (artists: string[]) => artists.slice(0, 12).map((artist, i) =
   source: 'mock'
 }));
 
-async function spotify(path: string, accessToken: string) {
+async function spotify(path: string, accessToken: string, retries = 2): Promise<any> {
   const res = await fetch(`https://api.spotify.com/v1${path}`, {
     headers: { authorization: `Bearer ${accessToken}` }
   });
+  // Back off and retry on rate limiting (Spotify sends Retry-After in seconds).
+  if (res.status === 429 && retries > 0) {
+    const wait = Math.min(Number(res.headers.get('retry-after') || 1), 10);
+    await new Promise(r => setTimeout(r, (wait + 0.3) * 1000));
+    return spotify(path, accessToken, retries - 1);
+  }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -201,14 +207,16 @@ async function pathfinderConcerts(artistId: string, artistName: string, retry = 
   return items.map((item: any) => {
     const c = item.data || {};
     const id = String(c.uri || '').split(':').pop() || '';
+    const lineup = (c.artists?.items || []).map((a: any) => a.data?.profile?.name).filter(Boolean);
+    const name = artistName || c.title || lineup[0] || 'Concert';
     return {
       id,
       artistId,
-      artist: artistName,
-      name: c.title || artistName,
+      artist: name,
+      name: c.title || name,
       date: c.startDateIsoString || '',
       city: c.location?.city || '',
-      lineup: (c.artists?.items || []).map((a: any) => a.data?.profile?.name).filter(Boolean),
+      lineup: lineup.length ? lineup : [name],
       type: 'Spotify concert',
       url: `https://open.spotify.com/concert/${id}`,
       source: 'spotify-pathfinder'
@@ -466,17 +474,17 @@ async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
   let events: any[] = [];
   let source = 'spotify-pathfinder';
   try {
-    // One Spotify call gives name + image for every artist; pathfinder gives the
-    // shows. Warm the token once, then fan out (pooled to avoid rate limits).
-    const metaMap = await getArtistMeta(accessToken, ids); // id -> { name, image }
+    // Pathfinder gives the shows (and the artist name); images come from the lazy
+    // detail enrich and the frontend's artist list — so NO per-chunk /v1/artists
+    // calls here (those were the rate-limit source). Warm the token, then fan out.
     await getHarvest();
-    const perArtist = await mapPool(ids, 10, id =>
-      pathfinderConcerts(id, metaMap.get(id)?.name || id).catch(error => {
+    const perArtist = await mapPool(ids, 8, id =>
+      pathfinderConcerts(id, '').catch(error => {
         logAuth('pathfinder_error', { artistId: id, message: error instanceof Error ? error.message : 'pathfinder failed' });
         return [] as any[];
       })
     );
-    events = perArtist.flat().map((e: any) => ({ ...e, image: metaMap.get(e.artistId)?.image || null }));
+    events = perArtist.flat();
   } catch (error) {
     logAuth('fast_path_failed', { message: error instanceof Error ? error.message : 'fast path failed' });
   }

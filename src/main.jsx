@@ -283,9 +283,10 @@ function App() {
       if (!ids.length) { setLoading(''); return; }
       enrichedRef.current = new Set();
       setEvents([]);
+      const imgById = new Map(list.map(a => [a.id, a.image]));
       // Stream the show lists in small chunks with a client-side pool so the
       // count badges fill in progressively instead of waiting for everyone.
-      const CHUNK = 6, POOL = 4;
+      const CHUNK = 6, POOL = 3;
       const chunks = [];
       for (let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK));
       let next = 0, done = 0;
@@ -295,7 +296,10 @@ function App() {
           const chunk = chunks[next++];
           try {
             const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: chunk }) }).then(readJson);
-            if (res.events?.length) setEvents(cur => [...cur, ...res.events]);
+            if (res.events?.length) {
+              const withImg = res.events.map(e => ({ ...e, image: e.image || imgById.get(e.artistId) || null }));
+              setEvents(cur => [...cur, ...withImg]);
+            }
           } catch {}
           done += chunk.length;
           setLoading(done < ids.length ? `Finding shows (${done}/${ids.length})` : '');
