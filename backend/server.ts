@@ -271,8 +271,14 @@ function parseConcertDetailHtml(html: string, concertId: string) {
   return empty;
 }
 
-async function fetchConcertDetail(url: string, concertId: string) {
-  const res = await fetch(url, { headers: { 'user-agent': CURL_UA, accept: 'text/html' } });
+async function fetchConcertDetail(url: string, concertId: string, retries = 2): Promise<any> {
+  const res = await fetch(url, { headers: { 'user-agent': CURL_UA, accept: 'text/html' }, signal: AbortSignal.timeout(15000) });
+  // open.spotify.com rate-limits by IP — back off on 429 and retry.
+  if (res.status === 429 && retries > 0) {
+    const wait = Math.min(Number(res.headers.get('retry-after') || 2), 15);
+    await new Promise(r => setTimeout(r, (wait + 0.3) * 1000));
+    return fetchConcertDetail(url, concertId, retries - 1);
+  }
   if (!res.ok) throw new Error(`detail ${res.status}`);
   return parseConcertDetailHtml(await res.text(), concertId);
 }
@@ -294,7 +300,7 @@ async function enrichConcertsHttp(events: any[]) {
       }
     }
   }
-  const poolSize = Math.min(8, events.length);
+  const poolSize = Math.min(4, events.length);
   await Promise.all(Array.from({ length: poolSize }, () => worker()));
   return events;
 }
