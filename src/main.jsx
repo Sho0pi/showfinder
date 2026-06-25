@@ -192,7 +192,7 @@ function App() {
 
   async function loadArtists() {
     setLoading('Loading your Spotify artists'); setError('');
-    try { const data = await fetch(`${API}/artists`, { headers: { authorization: `Bearer ${token}` } }).then(readJson); setArtists(data.artists || []); setSelected((data.artists || []).slice(0, 20).map(a => a.id)); }
+    try { const data = await fetch(`${API}/artists`, { headers: { authorization: `Bearer ${token}` } }).then(readJson); setArtists(data.artists || []); }
     catch (e) { setError(e.message); } finally { setLoading(''); }
   }
 
