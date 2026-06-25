@@ -76,8 +76,10 @@ function ConcertMap({ events }) {
       if (uncached.length) setStatus(`Placing ${uncached.length} new ${uncached.length === 1 ? 'city' : 'cities'} on the map`);
       for (const event of events) {
         if (cancelled) return;
-        const wasUncached = event.city && !(String(event.city).trim().toLowerCase() in cache);
-        const coords = await geocodeCity(event.city, cache);
+        // Prefer exact coordinates from the detail data; geocode the city only as fallback.
+        const hasCoords = event.lat != null && event.lon != null;
+        const wasUncached = !hasCoords && event.city && !(String(event.city).trim().toLowerCase() in cache);
+        const coords = hasCoords ? { lat: event.lat, lon: event.lon } : await geocodeCity(event.city, cache);
         if (cancelled) return;
         if (!coords) continue;
         const when = `${event.dayLabel ? event.dayLabel + ' ' : ''}${event.date ? new Date(event.date).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Date TBA'}`;
@@ -195,9 +197,20 @@ function App() {
   }
 
   async function findConcerts() {
-    setLoading('Checking Spotify concert pages'); setError('');
-    try { const data = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: selected }) }).then(readJson); setEvents(data.events || []); }
-    catch (e) { setError(e.message); } finally { setLoading(''); }
+    setLoading('Loading your shows'); setError('');
+    try {
+      const data = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: selected }) }).then(readJson);
+      const list = data.events || [];
+      setEvents(list);
+      setLoading('');
+      // Background enrich: venue/genres/vendor/coords fill in without blocking.
+      if (list.length) {
+        fetch(`${API}/concert-detail`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ concerts: list.map(e => ({ id: e.id, url: e.url })) }) })
+          .then(readJson)
+          .then(({ details }) => setEvents(cur => cur.map(e => details?.[e.id] ? { ...e, ...details[e.id] } : e)))
+          .catch(() => {});
+      }
+    } catch (e) { setError(e.message); setLoading(''); }
   }
 
   useEffect(() => {

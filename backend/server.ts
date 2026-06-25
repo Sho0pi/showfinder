@@ -109,6 +109,151 @@ function stripHtml(value: string) {
 
 const SCRAPER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+// ── Fast path: harvest a pathfinder token once, replay the API for every artist ──
+// The concerts page authorizes pathfinder with authorization + client-token +
+// spotify-app-version headers and a persisted query hash. We capture those live
+// from one browser load (so a Spotify deploy that rotates the hash self-heals on
+// the next harvest), cache them, and then hit the API with plain fetch.
+const HARVEST_TTL_MS = 40 * 60 * 1000;
+let harvestCache: { headers: Record<string, string>; hash: string; capturedAt: number } | null = null;
+
+async function harvestSpotifyApi() {
+  const { chromium } = await import('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ userAgent: SCRAPER_UA });
+    let cap: { headers: Record<string, string>; hash: string } | null = null;
+    page.on('request', (req) => {
+      if (cap || !req.url().includes('pathfinder/v2/query') || req.method() !== 'POST') return;
+      let body: any = {};
+      try { body = JSON.parse(req.postData() || '{}'); } catch {}
+      if (!/concert/i.test(body.operationName || '')) return;
+      const h = req.headers();
+      cap = {
+        headers: {
+          authorization: h.authorization,
+          'client-token': h['client-token'],
+          'spotify-app-version': h['spotify-app-version'],
+          'app-platform': h['app-platform'] || 'WebPlayer',
+          'user-agent': h['user-agent'] || SCRAPER_UA,
+          accept: 'application/json',
+          'content-type': 'application/json;charset=UTF-8'
+        },
+        hash: body.extensions?.persistedQuery?.sha256Hash || ''
+      };
+    });
+    await page.goto('https://open.spotify.com/artist/0jq1z5MQSlFtvpbnLzeEul/concerts', { waitUntil: 'networkidle', timeout: 60000 });
+    await page.waitForTimeout(2500);
+    if (!cap || !cap.headers.authorization || !cap.headers['client-token'] || !cap.hash) {
+      throw new Error('Failed to harvest pathfinder credentials');
+    }
+    harvestCache = { ...cap, capturedAt: Date.now() };
+    return harvestCache;
+  } finally {
+    await browser.close();
+  }
+}
+
+async function getHarvest(force = false) {
+  if (!force && harvestCache && Date.now() - harvestCache.capturedAt < HARVEST_TTL_MS) return harvestCache;
+  return harvestSpotifyApi();
+}
+
+// Fetch one artist's concerts from pathfinder. Re-harvests once on 401/403.
+async function pathfinderConcerts(artistId: string, artistName: string, retry = true): Promise<any[]> {
+  const harvest = await getHarvest();
+  const body = JSON.stringify({
+    variables: { artistUri: `spotify:artist:${artistId}`, geoHash: null, includeNearby: false },
+    operationName: 'ArtistConcerts',
+    extensions: { persistedQuery: { version: 1, sha256Hash: harvest.hash } }
+  });
+  const res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', { method: 'POST', headers: harvest.headers, body });
+  if ((res.status === 401 || res.status === 403) && retry) {
+    await getHarvest(true);
+    return pathfinderConcerts(artistId, artistName, false);
+  }
+  if (!res.ok) throw new Error(`pathfinder ${res.status}`);
+  const data = await res.json();
+  const items = data?.data?.concerts?.concerts?.items || [];
+  return items.map((item: any) => {
+    const c = item.data || {};
+    const id = String(c.uri || '').split(':').pop() || '';
+    return {
+      id,
+      artistId,
+      artist: artistName,
+      name: c.title || artistName,
+      date: c.startDateIsoString || '',
+      city: c.location?.city || '',
+      lineup: (c.artists?.items || []).map((a: any) => a.data?.profile?.name).filter(Boolean),
+      type: 'Spotify concert',
+      url: `https://open.spotify.com/concert/${id}`,
+      source: 'spotify-pathfinder'
+    };
+  }).filter((e: any) => e.id);
+}
+
+// ── Detail: curl-style fetch of /concert/{id} returns server-rendered HTML with a
+// base64 Redux-state blob carrying the full concert entity (venue, country, genres,
+// ticket vendor, AND coordinates). No browser, no token, no geocoding. ──
+const CURL_UA = 'curl/8.4.0';
+
+function parseConcertDetailHtml(html: string, concertId: string) {
+  const empty = { venue: null, country: null, lat: null, lon: null, dayLabel: null, genres: [] as string[], ticketVendor: null, ticketUrl: null, onSale: false };
+  const blobs = html.match(/[A-Za-z0-9+/]{800,}={0,2}/g) || [];
+  for (const b64 of blobs) {
+    let json: any;
+    try { json = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { continue; }
+    const items = json?.session?.entities?.items || json?.entities?.items;
+    if (!items) continue;
+    const key = Object.keys(items).find(k => k.includes(concertId)) || Object.keys(items).find(k => k.startsWith('spotify:concert:'));
+    if (!key) continue;
+    const c = items[key];
+    const offer = c.offers?.items?.[0] || {};
+    const dayLabel = c.startDateIsoString ? new Date(c.startDateIsoString).toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }) : null;
+    return {
+      venue: c.location?.name || null,
+      country: c.location?.country || null,
+      lat: c.location?.coordinates?.latitude ?? null,
+      lon: c.location?.coordinates?.longitude ?? null,
+      dayLabel,
+      genres: (c.concepts?.items || []).map((g: any) => g.data?.name).filter(Boolean),
+      ticketVendor: offer.providerName || null,
+      ticketUrl: offer.url || null,
+      onSale: String(offer.saleType || '').includes('on-sale')
+    };
+  }
+  return empty;
+}
+
+async function fetchConcertDetail(url: string, concertId: string) {
+  const res = await fetch(url, { headers: { 'user-agent': CURL_UA, accept: 'text/html' } });
+  if (!res.ok) throw new Error(`detail ${res.status}`);
+  return parseConcertDetailHtml(await res.text(), concertId);
+}
+
+// Enrich events with detail fields via concurrent HTTP fetches, cached by concert id.
+async function enrichConcertsHttp(events: any[]) {
+  let next = 0;
+  async function worker() {
+    while (next < events.length) {
+      const event = events[next++];
+      const cached = concertDetailCache.get(event.id);
+      if (cached) { Object.assign(event, cached); continue; }
+      try {
+        const detail = await fetchConcertDetail(event.url, event.id);
+        concertDetailCache.set(event.id, detail);
+        Object.assign(event, detail);
+      } catch (detailError) {
+        logAuth('concert_detail_http_error', { id: event.id, message: detailError instanceof Error ? detailError.message : 'Detail fetch failed' });
+      }
+    }
+  }
+  const poolSize = Math.min(8, events.length);
+  await Promise.all(Array.from({ length: poolSize }, () => worker()));
+  return events;
+}
+
 // Scrape an artist's /concerts page for the list of shows (page reused by caller).
 async function scrapeArtistConcerts(page: any, artist: any) {
   const artistUrl = `https://open.spotify.com/artist/${artist.id}/concerts`;
@@ -226,7 +371,23 @@ async function scrapeSpotifyConcertPage(artist: any) {
   }
 }
 
-async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
+// Fetch name + image for many artists in one Spotify API call (up to 50 ids).
+async function getArtistMeta(accessToken: string, artistIds: string[]) {
+  const map = new Map<string, { name: string; image: string | null }>();
+  for (let i = 0; i < artistIds.length; i += 50) {
+    const ids = artistIds.slice(i, i + 50).join(',');
+    try {
+      const data = await spotify(`/artists?ids=${ids}`, accessToken);
+      for (const a of data.artists || []) if (a?.id) map.set(a.id, { name: a.name || a.id, image: a.images?.[0]?.url || null });
+    } catch (error) {
+      logAuth('artist_meta_error', { message: error instanceof Error ? error.message : 'Meta fetch failed' });
+    }
+  }
+  return map;
+}
+
+// Browser fallback when the pathfinder fast path is unavailable.
+async function getConcertsViaBrowser(accessToken: string, artistIds: string[]) {
   const { chromium } = await import('playwright');
   const events = [];
   const browser = await chromium.launch({ headless: true });
@@ -246,8 +407,35 @@ async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
   } finally {
     await browser.close();
   }
+  return events;
+}
+
+async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
+  const ids = artistIds.slice(0, 25);
+  let events: any[] = [];
+  let source = 'spotify-pathfinder';
+  try {
+    // One Spotify call gives name + image for every artist; pathfinder gives the
+    // shows. Warm the token once, then fan out concurrently (plain fetches).
+    const metaMap = await getArtistMeta(accessToken, ids); // id -> { name, image }
+    await getHarvest();
+    const perArtist = await Promise.all(ids.map(id =>
+      pathfinderConcerts(id, metaMap.get(id)?.name || id).catch(error => {
+        logAuth('pathfinder_error', { artistId: id, message: error instanceof Error ? error.message : 'pathfinder failed' });
+        return [] as any[];
+      })
+    ));
+    events = perArtist.flat().map((e: any) => ({ ...e, image: metaMap.get(e.artistId)?.image || null }));
+  } catch (error) {
+    logAuth('fast_path_failed', { message: error instanceof Error ? error.message : 'fast path failed' });
+  }
+  // Fallback to the browser scrape if the fast path produced nothing.
+  if (!events.length) {
+    source = 'spotify-page-scrape';
+    events = await getConcertsViaBrowser(accessToken, ids);
+  }
   events.sort((a: any, b: any) => String(a.date || '').localeCompare(String(b.date || '')));
-  return { events, source: 'spotify-page-scrape', message: events.length ? '' : 'No Spotify concerts were returned for the selected artists.' };
+  return { events, source, message: events.length ? '' : 'No Spotify concerts were returned for the selected artists.' };
 }
 
 Bun.serve({
@@ -346,6 +534,16 @@ Bun.serve({
         const { artistIds = [] } = await req.json();
         return json(await getSpotifyConcerts(token, artistIds));
       }
+      if (url.pathname === '/api/concert-detail' && req.method === 'POST') {
+        // Background enrichment: venue/country/genres/vendor/coords via curl-style
+        // HTTP fetch of each concert page. No auth needed (public SSR data).
+        const { concerts = [] } = await req.json();
+        const events = (concerts as any[]).filter(c => c?.id && c?.url).slice(0, 100);
+        await enrichConcertsHttp(events);
+        const byId: Record<string, any> = {};
+        for (const e of events) byId[e.id] = { venue: e.venue, country: e.country, lat: e.lat, lon: e.lon, dayLabel: e.dayLabel, genres: e.genres, ticketVendor: e.ticketVendor, ticketUrl: e.ticketUrl, onSale: e.onSale };
+        return json({ details: byId });
+      }
       return serveStatic(url.pathname);
     } catch (error) {
       logAuth('server_error', { path: url.pathname, message: error instanceof Error ? error.message : 'Server error' });
@@ -354,3 +552,8 @@ Bun.serve({
   }
 });
 console.log(`App listening on http://localhost:${PORT}`);
+
+// Pre-warm the pathfinder token at boot and keep it warm ahead of its TTL, so
+// the first user request never pays the ~5s browser-harvest cost.
+getHarvest().then(() => console.log('[harvest] pathfinder token pre-warmed')).catch(() => {});
+setInterval(() => { getHarvest(true).catch(() => {}); }, HARVEST_TTL_MS - 5 * 60 * 1000);
