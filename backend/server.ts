@@ -145,6 +145,7 @@ const SCRAPER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // the next harvest), cache them, and then hit the API with plain fetch.
 const HARVEST_TTL_MS = 40 * 60 * 1000;
 let harvestCache: { headers: Record<string, string>; hash: string; capturedAt: number } | null = null;
+let harvestInFlight: Promise<any> | null = null;
 
 async function harvestSpotifyApi() {
   const { chromium } = await import('playwright');
@@ -183,12 +184,18 @@ async function harvestSpotifyApi() {
   }
 }
 
+// Coalesce concurrent harvests — under load many pathfinder calls can 401/403 at
+// once; without this each would launch its own browser (a launch storm that locks
+// the machine). All callers share one in-flight harvest.
 async function getHarvest(force = false) {
   if (!force && harvestCache && Date.now() - harvestCache.capturedAt < HARVEST_TTL_MS) return harvestCache;
-  return harvestSpotifyApi();
+  if (harvestInFlight) return harvestInFlight;
+  harvestInFlight = harvestSpotifyApi().finally(() => { harvestInFlight = null; });
+  return harvestInFlight;
 }
 
-// Fetch one artist's concerts from pathfinder. Re-harvests once on 401/403.
+// Fetch one artist's concerts from pathfinder. Re-harvests once on 401/403,
+// backs off once on 429, and times out so a hung request can't stall a worker.
 async function pathfinderConcerts(artistId: string, artistName: string, retry = true): Promise<any[]> {
   const harvest = await getHarvest();
   const body = JSON.stringify({
@@ -196,9 +203,14 @@ async function pathfinderConcerts(artistId: string, artistName: string, retry = 
     operationName: 'ArtistConcerts',
     extensions: { persistedQuery: { version: 1, sha256Hash: harvest.hash } }
   });
-  const res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', { method: 'POST', headers: harvest.headers, body });
+  const res = await fetch('https://api-partner.spotify.com/pathfinder/v2/query', { method: 'POST', headers: harvest.headers, body, signal: AbortSignal.timeout(15000) });
   if ((res.status === 401 || res.status === 403) && retry) {
     await getHarvest(true);
+    return pathfinderConcerts(artistId, artistName, false);
+  }
+  if (res.status === 429 && retry) {
+    const wait = Math.min(Number(res.headers.get('retry-after') || 2), 10);
+    await new Promise(r => setTimeout(r, (wait + 0.3) * 1000));
     return pathfinderConcerts(artistId, artistName, false);
   }
   if (!res.ok) throw new Error(`pathfinder ${res.status}`);

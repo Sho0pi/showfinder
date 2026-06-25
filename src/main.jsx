@@ -295,7 +295,7 @@ function App() {
         while (next < chunks.length) {
           const chunk = chunks[next++];
           try {
-            const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: chunk }) }).then(readJson);
+            const res = await fetch(`${API}/spotify-concerts`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ artistIds: chunk }), signal: AbortSignal.timeout(40000) }).then(readJson);
             if (res.events?.length) {
               const withImg = res.events.map(e => ({ ...e, image: e.image || imgById.get(e.artistId) || null }));
               setEvents(cur => [...cur, ...withImg]);
