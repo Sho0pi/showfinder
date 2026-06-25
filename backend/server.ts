@@ -447,21 +447,35 @@ async function getConcertsViaBrowser(accessToken: string, artistIds: string[]) {
   return events;
 }
 
+// Run fn over items with at most `limit` in flight, preserving input order.
+async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return out;
+}
+
 async function getSpotifyConcerts(accessToken: string, artistIds: string[]) {
-  const ids = artistIds.slice(0, 25);
+  const ids = artistIds.slice(0, 100);
   let events: any[] = [];
   let source = 'spotify-pathfinder';
   try {
     // One Spotify call gives name + image for every artist; pathfinder gives the
-    // shows. Warm the token once, then fan out concurrently (plain fetches).
+    // shows. Warm the token once, then fan out (pooled to avoid rate limits).
     const metaMap = await getArtistMeta(accessToken, ids); // id -> { name, image }
     await getHarvest();
-    const perArtist = await Promise.all(ids.map(id =>
+    const perArtist = await mapPool(ids, 10, id =>
       pathfinderConcerts(id, metaMap.get(id)?.name || id).catch(error => {
         logAuth('pathfinder_error', { artistId: id, message: error instanceof Error ? error.message : 'pathfinder failed' });
         return [] as any[];
       })
-    ));
+    );
     events = perArtist.flat().map((e: any) => ({ ...e, image: metaMap.get(e.artistId)?.image || null }));
   } catch (error) {
     logAuth('fast_path_failed', { message: error instanceof Error ? error.message : 'fast path failed' });
