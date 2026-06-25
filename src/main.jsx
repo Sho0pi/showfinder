@@ -297,6 +297,7 @@ function App() {
   const [artistSearch, setArtistSearch] = useState('');
   const [hideEmpty, setHideEmpty] = useState(false);
   const [regionSet, setRegionSet] = useState(() => new Set());
+  const [topN, setTopN] = useState(0);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -492,7 +493,16 @@ function App() {
           <div className="mt-4">
             <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted">Select top</div>
             <div className="mt-2 flex gap-1.5">
-              {[20, 40, 50, 100].map(n => <button key={n} disabled={!artists.length} onClick={() => setSelected(artists.slice(0, n).map(a => a.id))} className={`flex-1 ${ghostCls}`}>{n}</button>)}
+              {[20, 40, 50, 100].map(n => <button key={n} disabled={!artists.length} onClick={() => { setTopN(n); setSelected(artists.slice(0, n).map(a => a.id)); }} className={`flex-1 ${ghostCls}`}>{n}</button>)}
+            </div>
+            <div className="mt-3 flex items-center gap-3">
+              <input
+                type="range" min={0} max={artists.length || 0} value={Math.min(topN, artists.length)} disabled={!artists.length}
+                onChange={e => { const n = Number(e.target.value); setTopN(n); setSelected(artists.slice(0, n).map(a => a.id)); }}
+                className="h-1.5 flex-1 accent-ember disabled:opacity-40"
+                aria-label="Select top N artists"
+              />
+              <span className="w-16 text-right font-mono text-xs text-muted">{Math.min(topN, artists.length)}/{artists.length}</span>
             </div>
           </div>
           <div className="mt-4 grid gap-2.5 border-t border-line pt-4">
