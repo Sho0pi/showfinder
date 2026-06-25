@@ -156,7 +156,7 @@ function LoginScreen({ auth }) {
 function ArtistRail({ artists, selected, toggle, counts }) {
   if (!artists.length) return null;
   return (
-    <div className="flex max-h-[320px] flex-wrap content-start gap-x-4 gap-y-5 overflow-y-auto pr-1">
+    <div className="flex max-h-[320px] flex-wrap content-start gap-x-4 gap-y-5 overflow-y-auto px-1 pt-2 pr-1">
       {artists.map((a) => {
         const on = selected.includes(a.id);
         const count = counts[a.id] || 0;
@@ -166,13 +166,17 @@ function ArtistRail({ artists, selected, toggle, counts }) {
             onClick={() => toggle(a.id)}
             aria-pressed={on}
             title={a.name}
-            className={`flex w-[84px] flex-none flex-col items-center text-center transition ${on ? '' : 'opacity-50 hover:opacity-100'}`}
+            className="relative flex w-[84px] flex-none flex-col items-center text-center"
           >
+            {/* Avatar (clips the photo) */}
             <div className={`relative grid h-[78px] w-[78px] place-items-center overflow-hidden rounded-full bg-surface2 font-display text-2xl font-extrabold text-muted ${on ? 'shadow-[0_0_0_3px_var(--color-ember)]' : 'shadow-[0_0_0_1px_var(--color-line)]'}`}>
-              {a.image ? <img src={a.image} alt={a.name} loading="lazy" className="h-full w-full object-cover" /> : (a.name?.[0] || '?')}
-              {count > 0 && !on && <span className="absolute -right-1 -top-1 grid h-5 min-w-5 place-items-center rounded-full border-2 border-surface bg-ember px-1 font-mono text-[10px] font-bold text-canvas">{count}</span>}
-              {on && <span className="absolute -bottom-0.5 -right-0.5 grid h-6 w-6 place-items-center rounded-full border-2 border-surface bg-ember text-canvas"><Check size={13} strokeWidth={3} /></span>}
+              <div className={`flex h-full w-full items-center justify-center transition ${on ? '' : 'opacity-50'}`}>
+                {a.image ? <img src={a.image} alt={a.name} loading="lazy" className="h-full w-full object-cover" /> : (a.name?.[0] || '?')}
+              </div>
             </div>
+            {/* Count badge — outside the clipped avatar so it's always visible */}
+            {count > 0 && <span className="absolute right-1 top-0 z-10 grid h-5 min-w-[20px] place-items-center rounded-full border-2 border-surface bg-ember px-1 font-mono text-[10px] font-bold text-canvas shadow">{count}</span>}
+            {on && <span className="absolute right-1 top-[58px] z-10 grid h-6 w-6 place-items-center rounded-full border-2 border-surface bg-ember text-canvas"><Check size={13} strokeWidth={3} /></span>}
             <div className={`mt-1.5 text-xs leading-tight break-words ${on ? 'font-semibold text-ink' : 'text-muted'}`}>{a.name}</div>
           </button>
         );
