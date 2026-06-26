@@ -6,3 +6,5 @@ dist/
 .env
 .gstack/
 .detail-cache.json
+.artist-image-cache.json
+.idea/

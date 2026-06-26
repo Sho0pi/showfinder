@@ -1,13 +1,30 @@
-const PORT = Number(Bun.env.PORT || Bun.env.API_PORT || 45678);
+const PORT = Number(Bun.env.PORT || Bun.env.API_PORT || 23432);
 const SPOTIFY_CLIENT_ID = Bun.env.SPOTIFY_CLIENT_ID || '';
 const SPOTIFY_CLIENT_SECRET = Bun.env.SPOTIFY_CLIENT_SECRET || '';
-const SPOTIFY_REDIRECT_URI = Bun.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:45678/callback';
+const SPOTIFY_REDIRECT_URI = Bun.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:23432/callback';
 const DIST_DIR = new URL('../dist/', import.meta.url);
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
   status,
   headers: { 'content-type': 'application/json' }
 });
+
+// Spotify auth codes are single-use. The browser sometimes hits /callback twice
+// with the same code (double navigation / prefetch); the second exchange would
+// fail and bounce the user back to login. Dedupe by sharing the in-flight token
+// exchange per code so a duplicate hit awaits the same result instead of
+// re-exchanging. Stores the promise so even truly-concurrent hits coalesce.
+const codeExchanges = new Map<string, { promise: Promise<Response>; at: number }>();
+const CODE_CACHE_TTL = 60_000;
+function exchangeCode(code: string, run: () => Promise<Response>): Promise<Response> {
+  const now = Date.now();
+  for (const [key, val] of codeExchanges) if (now - val.at > CODE_CACHE_TTL) codeExchanges.delete(key);
+  const existing = codeExchanges.get(code);
+  if (existing) return existing.promise.then(res => res.clone());
+  const promise = run();
+  codeExchanges.set(code, { promise, at: now });
+  return promise.then(res => res.clone());
+}
 
 function logAuth(event: string, details: Record<string, unknown> = {}) {
   const safeDetails = { ...details };
@@ -44,14 +61,22 @@ async function serveStatic(pathname: string) {
   const decoded = decodeURIComponent(safePath);
   if (decoded.includes('..')) return json({ error: 'Bad path' }, 400);
 
+  // HTML must never be cached by the browser: it references hashed asset filenames
+  // that change every build, so a stale index.html points at a 404'd bundle → blank page.
+  // Hashed /assets/* files are immutable and safe to cache hard.
+  const isHtml = decoded === '/index.html' || decoded.endsWith('.html');
+  const cacheControl = isHtml || !decoded.startsWith('/assets/')
+    ? 'no-cache'
+    : 'public, max-age=31536000, immutable';
+
   const file = Bun.file(new URL(`.${decoded}`, DIST_DIR));
   if (await file.exists()) {
-    return new Response(file, { headers: { 'content-type': contentType(decoded) } });
+    return new Response(file, { headers: { 'content-type': contentType(decoded), 'cache-control': cacheControl } });
   }
 
   const index = Bun.file(new URL('./index.html', DIST_DIR));
   if (await index.exists()) {
-    return new Response(index, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    return new Response(index, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' } });
   }
 
   return json({ error: 'Frontend build not found. Run bun run build first.' }, 404);
@@ -70,15 +95,33 @@ const mockEvents = (artists: string[]) => artists.slice(0, 12).map((artist, i) =
   source: 'mock'
 }));
 
+// Thrown when Spotify rate-limits us with a cooldown too long to wait out inline.
+// Carries the Retry-After (seconds) so the API can tell the client when to retry.
+class SpotifyRateLimitError extends Error {
+  retryAfter: number;
+  constructor(retryAfter: number) {
+    super('Too many requests');
+    this.name = 'SpotifyRateLimitError';
+    this.retryAfter = retryAfter;
+  }
+}
+
+// Only wait out SHORT, transient limits inline. A long cooldown (a blown
+// Development-Mode quota) must fail fast — retrying just fires more requests
+// during the ban window and pushes the Retry-After even higher.
+const MAX_INLINE_RETRY_WAIT = 5;
+
 async function spotify(path: string, accessToken: string, retries = 2): Promise<any> {
   const res = await fetch(`https://api.spotify.com/v1${path}`, {
     headers: { authorization: `Bearer ${accessToken}` }
   });
-  // Back off and retry on rate limiting (Spotify sends Retry-After in seconds).
-  if (res.status === 429 && retries > 0) {
-    const wait = Math.min(Number(res.headers.get('retry-after') || 1), 10);
-    await new Promise(r => setTimeout(r, (wait + 0.3) * 1000));
-    return spotify(path, accessToken, retries - 1);
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get('retry-after') || 1);
+    if (retryAfter <= MAX_INLINE_RETRY_WAIT && retries > 0) {
+      await new Promise(r => setTimeout(r, (retryAfter + 0.3) * 1000));
+      return spotify(path, accessToken, retries - 1);
+    }
+    throw new SpotifyRateLimitError(retryAfter);
   }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -126,6 +169,7 @@ async function getTopArtists(accessToken: string) {
       const data = await spotify(`/me/top/artists?limit=50&time_range=${ranges[r]}`, accessToken);
       (data.items || []).forEach((a: any, i: number) => { if (a.id && !rank.has(a.id)) rank.set(a.id, r * 100 + i); });
     } catch (error) {
+      if (error instanceof SpotifyRateLimitError) throw error; // fail fast, surface retryAfter
       logAuth('top_artists_error', { range: ranges[r], message: error instanceof Error ? error.message : 'top fetch failed' });
     }
   }
@@ -227,8 +271,14 @@ async function pathfinderConcerts(artistId: string, artistName: string, retry = 
   return items.map((item: any) => {
     const c = item.data || {};
     const id = String(c.uri || '').split(':').pop() || '';
-    const lineup = (c.artists?.items || []).map((a: any) => a.data?.profile?.name).filter(Boolean);
+    const artistItems = c.artists?.items || [];
+    const lineup = artistItems.map((a: any) => a.data?.profile?.name).filter(Boolean);
     const name = artistName || c.title || lineup[0] || 'Concert';
+    // Reuse the lineup's avatar for this artist so events carry an image straight
+    // from pathfinder (reliable, separate rate-limit bucket) — no need to wait for
+    // the lazy concert-detail enrichment, and a source for the artist-rail avatar.
+    const mine = artistItems.find((a: any) => String(a.uri || a.data?.uri || '').includes(artistId)) || artistItems[0];
+    const image = pickImage(mine?.data?.visuals?.avatarImage?.sources, 320);
     return {
       id,
       artistId,
@@ -239,7 +289,8 @@ async function pathfinderConcerts(artistId: string, artistName: string, retry = 
       lineup: lineup.length ? lineup : [name],
       type: 'Spotify concert',
       url: `https://open.spotify.com/concert/${id}`,
-      source: 'spotify-pathfinder'
+      source: 'spotify-pathfinder',
+      image
     };
   }).filter((e: any) => e.id);
 }
@@ -444,6 +495,24 @@ setInterval(() => {
 }, 5000);
 const DETAIL_CONCURRENCY = 5;
 
+// Persist fetched artist images to disk. Spotify's Dev-Mode rate limit means we can
+// only fetch a slice per load before a 429; caching successes means each load fills the
+// remaining gaps and never refetches, so over a few loads every artist resolves.
+const artistImageCache = new Map<string, { name: string; image: string | null }>();
+const ARTIST_IMG_CACHE_FILE = new URL('../.artist-image-cache.json', import.meta.url);
+try {
+  const f = Bun.file(ARTIST_IMG_CACHE_FILE);
+  if (await f.exists()) for (const [k, v] of Object.entries(await f.json())) artistImageCache.set(k, v as any);
+  console.log(`[cache] loaded ${artistImageCache.size} cached artist images`);
+} catch {}
+let artistImgCacheDirty = false;
+function cacheArtistImage(id: string, meta: { name: string; image: string | null }) { artistImageCache.set(id, meta); artistImgCacheDirty = true; }
+setInterval(() => {
+  if (!artistImgCacheDirty) return;
+  artistImgCacheDirty = false;
+  Bun.write(ARTIST_IMG_CACHE_FILE, JSON.stringify(Object.fromEntries(artistImageCache))).catch(() => {});
+}, 5000);
+
 // Enrich events with detail-page fields concurrently using a small pool of pages.
 // Cache hits skip the network; misses are scraped and cached. Per-event errors
 // are logged and leave the event with its basic (list) fields.
@@ -500,18 +569,36 @@ function pickImage(sources: any[], target = 320): string | null {
   return best.url || null;
 }
 
-// Fetch name + image for many artists in one Spotify API call (up to 50 ids).
+// Fetch name + image per artist. NOTE: the batch GET /artists?ids= endpoint returns
+// 403 for apps in Spotify Development Mode; the single GET /artists/{id} works — so we
+// fetch singles through a small concurrency pool. Images are non-critical: on rate
+// limit we stop and return what we have (artists fall back to a letter / pathfinder).
 async function getArtistMeta(accessToken: string, artistIds: string[]) {
   const map = new Map<string, { name: string; image: string | null }>();
-  for (let i = 0; i < artistIds.length; i += 50) {
-    const ids = artistIds.slice(i, i + 50).join(',');
-    try {
-      const data = await spotify(`/artists?ids=${ids}`, accessToken);
-      for (const a of data.artists || []) if (a?.id) map.set(a.id, { name: a.name || a.id, image: pickImage(a.images, 320) });
-    } catch (error) {
-      logAuth('artist_meta_error', { message: error instanceof Error ? error.message : 'Meta fetch failed' });
+  // Serve from the persistent cache first; only hit Spotify for ids we've never fetched.
+  const toFetch: string[] = [];
+  for (const id of artistIds) {
+    const cached = artistImageCache.get(id);
+    if (cached) map.set(id, cached); else toFetch.push(id);
+  }
+  let next = 0;
+  let fetched = 0;
+  let rateLimited = false;
+  const POOL = 6;
+  async function worker() {
+    while (next < toFetch.length && !rateLimited) {
+      const id = toFetch[next++];
+      try {
+        const a = await spotify(`/artists/${id}`, accessToken);
+        if (a?.id) { const meta = { name: a.name || a.id, image: pickImage(a.images, 320) }; map.set(a.id, meta); cacheArtistImage(a.id, meta); fetched++; }
+      } catch (error) {
+        if (error instanceof SpotifyRateLimitError) { rateLimited = true; return; }
+        logAuth('artist_meta_error', { id, message: error instanceof Error ? error.message : 'Meta fetch failed' });
+      }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(POOL, toFetch.length) }, () => worker()));
+  logAuth('artist_meta_done', { requested: artistIds.length, fromCache: artistIds.length - toFetch.length, fetched, got: map.size, rateLimited });
   return map;
 }
 
@@ -635,27 +722,44 @@ Bun.serve({
         const code = url.searchParams.get('code');
         const error = url.searchParams.get('error');
         const appUrl = url.origin;
-        logAuth('callback_received', { origin: url.origin, hasCode: Boolean(code), error, redirectUri: SPOTIFY_REDIRECT_URI });
+        logAuth('callback_received', { origin: url.origin, grantPresent: Boolean(code), accessBounce: url.searchParams.has('access_token'), error, redirectUri: SPOTIFY_REDIRECT_URI });
         if (error) {
           logAuth('callback_spotify_error', { error });
-          return Response.redirect(`${appUrl}/callback?error=${encodeURIComponent(error)}`, 302);
+          // Redirect to '/' (NOT '/callback') — '/callback' re-enters this handler with
+          // the same error param and 302-loops forever.
+          return Response.redirect(`${appUrl}/?error=${encodeURIComponent(error)}`, 302);
         }
         if (!code) return serveStatic('/');
-        const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: SPOTIFY_REDIRECT_URI });
-        const basic = btoa(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`);
-        const res = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { authorization: `Basic ${basic}`, 'content-type': 'application/x-www-form-urlencoded' }, body });
-        const data = await res.json();
-        if (!res.ok) {
-          logAuth('token_exchange_failed', { status: res.status, spotifyError: data.error, spotifyDescription: data.error_description });
-          return json(data, res.status);
-        }
-        logAuth('token_exchange_ok', { status: res.status, expiresIn: data.expires_in, scope: data.scope });
-        return Response.redirect(`${appUrl}/callback?access_token=${encodeURIComponent(data.access_token)}`, 302);
+        // Coalesce duplicate /callback hits carrying the same single-use code.
+        if (codeExchanges.has(code)) logAuth('token_exchange_replayed', {});
+        return exchangeCode(code, async () => {
+          const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: SPOTIFY_REDIRECT_URI });
+          const basic = btoa(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`);
+          const res = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { authorization: `Basic ${basic}`, 'content-type': 'application/x-www-form-urlencoded' }, body });
+          const data = await res.json();
+          if (!res.ok) {
+            logAuth('token_exchange_failed', { status: res.status, spotifyError: data.error, spotifyDescription: data.error_description });
+            return json(data, res.status);
+          }
+          logAuth('token_exchange_ok', { status: res.status, expiresIn: data.expires_in, scope: data.scope });
+          return Response.redirect(`${appUrl}/callback?access_token=${encodeURIComponent(data.access_token)}`, 302);
+        });
       }
       if (url.pathname === '/api/me') {
         const token = req.headers.get('authorization')?.replace('Bearer ', '');
         if (!token) return json({ authenticated: false }, 401);
-        const user = await spotify('/me', token);
+        const res = await fetch('https://api.spotify.com/v1/me', { headers: { authorization: `Bearer ${token}` } });
+        // Rate-limited is TRANSIENT — keep the session so the client doesn't log out.
+        if (res.status === 429) {
+          logAuth('me_rate_limited', { retryAfter: res.headers.get('retry-after') });
+          return json({ authenticated: true, user: null, rateLimited: true });
+        }
+        if (!res.ok) {
+          const detail = await res.text().catch(() => '');
+          logAuth('me_failed', { status: res.status, detail: detail.slice(0, 300) });
+          return json({ authenticated: false }, res.status); // 401/403 = bad token
+        }
+        const user = await res.json();
         logAuth('spotify_user_loaded', { id: user.id, email: user.email, product: user.product });
         return json({ authenticated: true, user });
       }
@@ -677,6 +781,19 @@ Bun.serve({
           const key = artist.id || artist.name;
           if (!deduped.has(key)) deduped.set(key, { id: artist.id, name: artist.name, image: artist.images?.[0]?.url });
         }
+        // Liked-song artists come from simplified track.artists objects with NO
+        // images — backfill them in one batched call so the artist list and the
+        // (artist-image-fallback) show cards aren't left with blank avatars.
+        const needImage = [...deduped.values()].filter(a => a.id && !a.image).map(a => a.id);
+        let backfilled = 0;
+        if (needImage.length) {
+          const meta = await getArtistMeta(token, needImage);
+          for (const a of deduped.values()) {
+            if (!a.image && meta.has(a.id)) { const url = meta.get(a.id)!.image; if (url) { a.image = url; backfilled++; } }
+          }
+        }
+        const withImage = [...deduped.values()].filter(a => a.image).length;
+        logAuth('artists_built', { total: deduped.size, needImage: needImage.length, backfilled, withImage });
         // Order by listening affinity: top-artists rank, then liked-track count, then name.
         const likedCount = (id: string) => likedMap.get(id)?.count || 0;
         const artists = [...deduped.values()].filter(a => a.id).sort((a, b) => {
@@ -688,6 +805,18 @@ Bun.serve({
           return a.name.localeCompare(b.name);
         });
         return json({ artists });
+      }
+      if (url.pathname === '/api/artist-images' && req.method === 'POST') {
+        // Lightweight gap-filler: resolve images for specific artist ids (cache-first)
+        // WITHOUT re-running the heavy followed/liked/top aggregation. Lets the client
+        // top up missing avatars across loads until the disk cache is complete.
+        const token = req.headers.get('authorization')?.replace('Bearer ', '');
+        if (!token) return json({ error: 'Missing bearer token' }, 401);
+        const { ids = [] } = await req.json();
+        const meta = await getArtistMeta(token, (ids as string[]).slice(0, 400));
+        const images: Record<string, string | null> = {};
+        for (const [id, m] of meta) if (m.image) images[id] = m.image;
+        return json({ images });
       }
       if (url.pathname === '/api/spotify-concerts' && req.method === 'POST') {
         const token = req.headers.get('authorization')?.replace('Bearer ', '');
@@ -707,6 +836,10 @@ Bun.serve({
       }
       return serveStatic(url.pathname);
     } catch (error) {
+      if (error instanceof SpotifyRateLimitError) {
+        logAuth('rate_limited', { path: url.pathname, retryAfter: error.retryAfter });
+        return json({ error: 'Spotify is rate-limiting this account. Please wait before retrying.', rateLimited: true, retryAfter: error.retryAfter }, 429);
+      }
       logAuth('server_error', { path: url.pathname, message: error instanceof Error ? error.message : 'Server error' });
       return json({ error: error instanceof Error ? error.message : 'Server error' }, 500);
     }

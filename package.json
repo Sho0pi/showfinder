@@ -12,12 +12,19 @@
     "start": "bun backend/server.ts"
   },
   "dependencies": {
+    "@deck.gl/aggregation-layers": "^9.3.5",
+    "@deck.gl/core": "^9.3.5",
+    "@deck.gl/layers": "^9.3.5",
+    "@deck.gl/mapbox": "^9.3.5",
     "@vitejs/plugin-react": "latest",
     "framer-motion": "^12.42.0",
     "lucide-react": "^1.21.0",
+    "maplibre-gl": "^5.24.0",
     "playwright": "^1.61.1",
     "react": "latest",
     "react-dom": "latest",
+    "terra-draw": "^1.31.2",
+    "terra-draw-maplibre-gl-adapter": "^1.4.1",
     "typescript": "latest",
     "vite": "latest"
   },

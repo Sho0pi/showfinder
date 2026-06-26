@@ -70,28 +70,50 @@ body::before {
   border: 2px solid transparent;
 }
 
-/* Leaflet: dark popup + coral teardrop pin */
-.leaflet-popup-content-wrapper {
+/* MapLibre: dark themed popup */
+.maplibregl-popup-content {
   background: var(--color-surface);
   color: var(--color-ink);
   border-radius: var(--radius-md);
   border: 1px solid var(--color-line);
+  padding: 12px 14px;
+  font-family: var(--font-body);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
 }
-.leaflet-popup-tip { background: var(--color-surface); }
-.leaflet-popup-content { margin: 12px 14px; font-family: var(--font-body); }
-.leaflet-popup-content a { color: var(--color-ember); font-weight: 600; }
-.leaflet-container { background: #0e1418; }
-.pin-teardrop {
-  position: relative;
-  width: 18px; height: 18px;
-  background: var(--color-ember);
-  border-radius: 50% 50% 50% 0;
-  transform: rotate(-45deg);
-  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.5);
+.maplibregl-popup-content a { color: var(--color-ember); font-weight: 600; }
+.maplibregl-popup-tip { border-top-color: var(--color-surface) !important; border-bottom-color: var(--color-surface) !important; }
+.maplibregl-popup-close-button { color: var(--color-muted); font-size: 18px; padding: 2px 6px; }
+.maplibregl-ctrl-group { background: var(--color-surface); border: 1px solid var(--color-line); }
+.maplibregl-ctrl-group button + button { border-top: 1px solid var(--color-line); }
+.maplibregl-ctrl button .maplibregl-ctrl-icon { filter: invert(1) hue-rotate(180deg) brightness(1.4); }
+
+/* Clean orange burst when the map finishes placing all shows — a bright core plus
+   an expanding ring, firing at the progress ring's start/end corner. */
+.map-spark {
+  width: 12px; height: 12px;
+  transform: translate(-50%, -50%);
 }
-.pin-teardrop::after {
-  content: ""; position: absolute; inset: 5px;
-  background: var(--color-canvas); border-radius: 50%;
+.map-spark::before, .map-spark::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+}
+/* Bright core flash */
+.map-spark::before {
+  background: radial-gradient(circle, #FFE9C8 0%, #FF7A4C 50%, rgba(255,90,60,0) 72%);
+  animation: map-spark-core 0.7s cubic-bezier(.2,.7,.3,1) forwards;
+}
+/* Expanding thin ring */
+.map-spark::after {
+  border: 1.5px solid rgba(255,122,76,0.9);
+  animation: map-spark-ring 0.75s cubic-bezier(.2,.7,.3,1) forwards;
+}
+@keyframes map-spark-core {
+  0%   { opacity: 0; transform: scale(0.2); }
+  30%  { opacity: 1; transform: scale(1.15); }
+  100% { opacity: 0; transform: scale(0.6); }
+}
+@keyframes map-spark-ring {
+  0%   { opacity: 0.9; transform: scale(0.3); }
+  100% { opacity: 0; transform: scale(3.4); }
 }
 
 @media (prefers-reduced-motion: reduce) {
